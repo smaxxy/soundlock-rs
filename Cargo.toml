@@ -1,6 +1,6 @@
 [package]
 name = "sound_lock_rust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Per-application audio loudness limiter for Windows"
 authors = ["WinsreWu <winsrewu@jawbts.org>"]
