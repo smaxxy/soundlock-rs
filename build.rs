@@ -1,5 +1,3 @@
 fn main() {
-    let mut res = winres::WindowsResource::new();
-    res.set_icon("assets/icon.ico");
-    res.compile().unwrap();
+    let _ = embed_resource::compile("app.rc", embed_resource::NONE);
 }
