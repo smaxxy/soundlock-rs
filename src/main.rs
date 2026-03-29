@@ -18,7 +18,11 @@ pub struct AppState {
 fn main() -> Result<(), ()> {
     env_logger::init();
 
-    let _instance = single_instance::SingleInstance::new("SoundLockRustInstance").unwrap();
+    let instance = single_instance::SingleInstance::new("SoundLockRustInstance").unwrap();
+
+    if !instance.is_single() {
+        return Ok(());
+    }
 
     let icon_data = image::load_from_memory(include_bytes!("../assets/icon.png"))
         .unwrap()
