@@ -1,0 +1,35 @@
+[package]
+name = "sound_lock_rust"
+version = "0.1.0"
+edition = "2024"
+description = "Per-application audio loudness limiter for Windows"
+authors = ["WinsreWu <winsrewu@jawbts.org>"]
+build = "build.rs"
+
+[dependencies]
+atomic_float = "1.1.0"
+cpal = "0.17.3"
+dirs = "6.0.0"
+eframe = "0.32.3"
+egui = "0.32.3"
+env_logger = "0.11.9"
+image = "0.25.10"
+log = "0.4.29"
+open = "5.3.3"
+ringbuf = "0.4.8"
+serde = { version = "1.0.228", features = ["derive"] }
+single-instance = "0.3.3"
+toml = "1.0.7"
+windows = { version = "0.62.2", features = [
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+]}
+
+[build-dependencies]
+winres = "0.1.12"
