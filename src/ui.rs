@@ -11,13 +11,13 @@ pub struct SettingsWindow {
     config: Arc<Mutex<Config>>,
     sessions: Vec<SessionInfo>,
     last_refresh: std::time::Instant,
-    input_devices: Vec<(Device, String)>,    // (device, id_string)
-    output_devices: Vec<(Device, String)>,   // (device, id_string)
+    input_devices: Vec<(Device, String)>,
+    output_devices: Vec<(Device, String)>,
     selected_input_idx: usize,
     selected_output_idx: usize,
     retry_start: bool,
     retry_stop: bool,
-    fonts_loaded: bool,   // 新加：中文字体加载标志
+    fonts_loaded: bool,
 }
 
 impl SettingsWindow {
@@ -55,7 +55,7 @@ impl SettingsWindow {
             selected_output_idx,
             retry_start: false,
             retry_stop: false,
-            fonts_loaded: false,   // 初始未加载
+            fonts_loaded: false,
         }
     }
 
@@ -204,10 +204,8 @@ impl SettingsWindow {
 
 impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // === 首次加载中文字体，解决中文显示为方框的问题 ===
         if !self.fonts_loaded {
             let mut fonts = egui::FontDefinitions::default();
-            // 尝试系统自带的微软雅黑（Windows 通用）
             if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\msyh.ttc") {
                 fonts.font_data.insert("MicrosoftYaHei".to_owned(), 
                     egui::FontData::from_owned(font_data));
@@ -215,30 +213,25 @@ impl eframe::App for SettingsWindow {
                     .or_default()
                     .insert(0, "MicrosoftYaHei".to_owned());
                 ctx.set_fonts(fonts);
+            } else if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\simsun.ttc") {
+                fonts.font_data.insert("SimSun".to_owned(), 
+                    egui::FontData::from_owned(font_data));
+                fonts.families.entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "SimSun".to_owned());
+                ctx.set_fonts(fonts);
             } else {
-                // 如果找不到微软雅黑，可以尝试其他字体（如宋体）
-                if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\simsun.ttc") {
-                    fonts.font_data.insert("SimSun".to_owned(), 
-                        egui::FontData::from_owned(font_data));
-                    fonts.families.entry(egui::FontFamily::Proportional)
-                        .or_default()
-                        .insert(0, "SimSun".to_owned());
-                    ctx.set_fonts(fonts);
-                } else {
-                    log::warn!("未找到中文字体，中文可能仍显示为方框");
-                }
+                log::warn!("未找到中文字体");
             }
             self.fonts_loaded = true;
         }
 
         self.refresh_if_needed();
 
-        // 重试启动
         if self.retry_start {
             self.start_limiting();
         }
 
-        // 重试停止
         if self.retry_stop {
             self.stop_limiting();
         }
@@ -281,15 +274,15 @@ impl eframe::App for SettingsWindow {
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(10.0, 10.0);
 
-                    ui.heading("Sound Lock Settings");
+                    ui.heading("Sound Lock 设置");
                     ui.separator();
 
                     ui.horizontal(|ui| {
-                        ui.label("Status:");
+                        ui.label("状态：");
                         let (color, text) = if is_limiting {
-                            (Color32::from_rgb(0, 200, 0), "Active")
+                            (Color32::from_rgb(0, 200, 0), "运行中")
                         } else {
-                            (Color32::GRAY, "Inactive")
+                            (Color32::GRAY, "未运行")
                         };
                         ui.colored_label(color, text);
                     });
@@ -297,26 +290,26 @@ impl eframe::App for SettingsWindow {
                     ui.separator();
 
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut operation_mode, OperationMode::WindowsAPI, "Windows API");
-                        ui.radio_value(&mut operation_mode, OperationMode::Cable, "Cable");
+                        ui.radio_value(&mut operation_mode, OperationMode::WindowsAPI, "Windows API 模式");
+                        ui.radio_value(&mut operation_mode, OperationMode::Cable, "虚拟声卡模式");
                     });
 
                     ui.separator();
 
                     if operation_mode == OperationMode::Cable {
                         ui.group(|ui| {
-                            ui.label("Audio Devices");
+                            ui.label("音频设备");
 
                             ui.horizontal(|ui| {
-                                ui.label("Input:");
+                                ui.label("输入：");
                                 let selected_text = if self.selected_input_idx == usize::MAX {
-                                    "None".to_owned()
+                                    "未选择".to_owned()
                                 } else {
                                     self.input_devices
                                         .get(self.selected_input_idx)
                                         .and_then(|(d, _)| d.description().ok())
                                         .map(|d| d.name().to_string())
-                                        .unwrap_or_else(|| "Unknown".to_string())
+                                        .unwrap_or_else(|| "未知设备".to_string())
                                 };
 
                                 egui::ComboBox::from_id_salt("input_device_combo")
@@ -327,7 +320,7 @@ impl eframe::App for SettingsWindow {
                                                 .description()
                                                 .ok()
                                                 .map(|desc| desc.name().to_string())
-                                                .unwrap_or_else(|| format!("Device {}", idx));
+                                                .unwrap_or_else(|| format!("设备 {}", idx));
                                             ui.selectable_value(
                                                 &mut self.selected_input_idx,
                                                 idx,
@@ -338,15 +331,15 @@ impl eframe::App for SettingsWindow {
                             });
 
                             ui.horizontal(|ui| {
-                                ui.label("Output:");
+                                ui.label("输出：");
                                 let selected_text = if self.selected_output_idx == usize::MAX {
-                                    "None".to_owned()
+                                    "未选择".to_owned()
                                 } else {
                                     self.output_devices
                                         .get(self.selected_output_idx)
                                         .and_then(|(d, _)| d.description().ok())
                                         .map(|d| d.name().to_string())
-                                        .unwrap_or_else(|| "Unknown".to_string())
+                                        .unwrap_or_else(|| "未知设备".to_string())
                                 };
 
                                 egui::ComboBox::from_id_salt("output_device_combo")
@@ -357,7 +350,7 @@ impl eframe::App for SettingsWindow {
                                                 .description()
                                                 .ok()
                                                 .map(|desc| desc.name().to_string())
-                                                .unwrap_or_else(|| format!("Device {}", idx));
+                                                .unwrap_or_else(|| format!("设备 {}", idx));
                                             ui.selectable_value(
                                                 &mut self.selected_output_idx,
                                                 idx,
@@ -368,9 +361,9 @@ impl eframe::App for SettingsWindow {
                             });
                         });
                     } else {
-                        ui.label("Select Application to Limit:");
+                        ui.label("选择要限制音量的应用：");
                         ui.horizontal(|ui| {
-                            if ui.button("Refresh List").clicked() {
+                            if ui.button("刷新列表").clicked() {
                                 self.refresh_sessions();
                             }
                         });
@@ -379,7 +372,7 @@ impl eframe::App for SettingsWindow {
                             ui.set_min_height(150.0);
                             ScrollArea::vertical().show(ui, |ui| {
                                 if self.sessions.is_empty() {
-                                    ui.label("No audio sessions found. Make sure an app is playing audio.");
+                                    ui.label("没有找到正在播放音频的应用");
                                 }
                                 for session in &self.sessions {
                                     let is_selected = selected_pid == Some(session.pid);
@@ -398,7 +391,7 @@ impl eframe::App for SettingsWindow {
 
                     ui.separator();
 
-                    ui.label("Maximum Loudness Threshold:");
+                    ui.label("最大音量阈值：");
                     ui.horizontal(|ui| {
                         ui.add(
                             Slider::new(&mut threshold_db, -60.0..=0.0)
@@ -410,38 +403,38 @@ impl eframe::App for SettingsWindow {
 
                     ui.separator();
 
-                    ui.label("Attack Time:");
+                    ui.label("触发时间：");
                     ui.horizontal(|ui| {
                         ui.add(
                             Slider::new(&mut attack_ms, 1..=300)
-                                .text("ms")
+                                .text("毫秒")
                                 .max_decimals(0),
                         );
                         ui.label(format!("{} ms", attack_ms));
                     });
 
-                    ui.label("Release Time:");
+                    ui.label("释放时间：");
                     ui.horizontal(|ui| {
                         ui.add(
                             Slider::new(&mut release_ms, 1..=300)
-                                .text("ms")
+                                .text("毫秒")
                                 .max_decimals(0),
                         );
                         ui.label(format!("{} ms", release_ms));
                     });
 
                     if operation_mode == OperationMode::WindowsAPI {
-                        ui.label("Volume Scan Interval:");
+                        ui.label("音量扫描间隔：");
                         ui.horizontal(|ui| {
                             ui.add(
                                 Slider::new(&mut scan_interval_ms, 1..=300)
-                                    .text("ms")
+                                    .text("毫秒")
                                     .max_decimals(0),
                             );
                             ui.label(format!("{} ms", scan_interval_ms));
                         });
 
-                        ui.label("Volume Change Percentage Threshold:");
+                        ui.label("音量变化阈值：");
                         ui.horizontal(|ui| {
                             ui.add(
                                 Slider::new(&mut volume_change_percentage_threshold, 0.01..=0.10)
@@ -459,28 +452,28 @@ impl eframe::App for SettingsWindow {
                         if !is_limiting {
                             let start_btn = ui.add_sized(
                                 btn_size,
-                                Button::new("Start Limiting").fill(Color32::from_rgb(0, 150, 0)),
+                                Button::new("启动限制").fill(Color32::from_rgb(0, 150, 0)),
                             );
                             if start_btn.clicked() {
                                 if selected_pid.is_some() || operation_mode == OperationMode::Cable {
                                     self.start_limiting();
                                 } else {
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                                        "Please select an application first".to_string(),
+                                        "请先选择一个应用".to_string(),
                                     ));
                                 }
                             }
                         } else {
                             let stop_btn = ui.add_sized(
                                 btn_size,
-                                Button::new("Stop").fill(Color32::from_rgb(200, 0, 0)),
+                                Button::new("停止").fill(Color32::from_rgb(200, 0, 0)),
                             );
                             if stop_btn.clicked() {
                                 self.stop_limiting();
                             }
                         }
 
-                        if ui.add_sized(btn_size, Button::new("Save Config")).clicked() {
+                        if ui.add_sized(btn_size, Button::new("保存设置")).clicked() {
                             match self.config.try_lock() {
                                 Ok(cfg) => self.save_config(&*cfg),
                                 Err(_) => log::error!("Cannot save config: lock poisoned"),
@@ -499,7 +492,7 @@ impl eframe::App for SettingsWindow {
                 });
         });
 
-        // 写回配置，变更时自动保存（已修复借用冲突）
+        // 写回配置
         let mut need_stop = false;
         {
             let mut config = match self.config.try_lock() {
