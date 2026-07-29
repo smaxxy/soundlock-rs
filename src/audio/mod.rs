@@ -39,7 +39,6 @@ pub fn start_limiter(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
 }
 
 fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
-    // 用 Arc<Mutex<>> 包装，使闭包和主循环都能访问
     let limiter = Arc::new(Mutex::new(LoudnessLimiter::new(Arc::clone(&config))));
 
     // 安全获取设备 ID
@@ -136,24 +135,23 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         let mut fell_behind = false;
 
-        let rms = if data.is_empty() {
-            0.0
+        // 使用多频段处理：每个采样点调用 process_sample_multiband
+        if let Ok(mut limiter_guard) = limiter_clone.try_lock() {
+            for &sample in data {
+                let processed = limiter_guard.process_sample_multiband(sample);
+                if producer.try_push(processed).is_err() {
+                    fell_behind = true;
+                }
+            }
         } else {
-            (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt()
-        };
-
-        // 安全获取增益，若锁忙则用 1.0（不衰减）
-        let gain = if let Ok(mut l) = limiter_clone.try_lock() {
-            l.calculate_gain(rms, data.len())
-        } else {
-            1.0
-        };
-
-        for &sample in data {
-            if producer.try_push(sample * gain).is_err() {
-                fell_behind = true;
+            // 锁忙时原样通过，保证不丢音频
+            for &sample in data {
+                if producer.try_push(sample).is_err() {
+                    fell_behind = true;
+                }
             }
         }
+
         if fell_behind {
             log::warn!("Output buffer full - try increasing latency");
         }
@@ -223,7 +221,6 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
             break;
         }
 
-        // 安全更新参数
         if let Ok(mut l) = limiter.lock() {
             l.update_parameters();
         }
@@ -237,7 +234,6 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
 }
 
 fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
-    // 使用 Arc<Mutex<>> 保持一致性（虽然 WinAPI 闭包不需要 move，但为简单也用）
     let limiter = Arc::new(Mutex::new(LoudnessLimiter::new(Arc::clone(&config))));
 
     let target_pid = match config.try_lock() {
@@ -262,7 +258,6 @@ fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config
         }
     };
 
-    // 记录原始音量作为固定基准，不再使用 get_volume
     let original_volume = volume_ctrl.get_original_volume();
     let mut last_gain = 0.0f32;
 
@@ -292,9 +287,7 @@ fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config
         };
 
         if let Ok(rms) = volume_ctrl.get_current_rms() {
-            // 计算目标增益（使用 calculate_gain 或者简单的计算，避免依赖缺失的 compute_target_gain）
             let target_gain = if let Ok(mut l) = limiter.try_lock() {
-                // 使用 calculate_gain 获取平滑后的增益（传 1 个采样点忽略平滑）
                 l.calculate_gain(rms, 1)
             } else {
                 last_gain
