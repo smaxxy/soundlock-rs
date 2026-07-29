@@ -94,28 +94,42 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
 
     // ----- 输入回调：逐采样调用多频段处理（分频限幅）-----
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        let mut fell_behind = false;
+    let mut fell_behind = false;
 
-        if let Ok(mut limiter_guard) = limiter_clone.try_lock() {
-            for &sample in data {
-                let processed = limiter_guard.process_sample_multiband(sample);
-                if producer.try_push(processed).is_err() {
-                    fell_behind = true;
-                }
-            }
-        } else {
-            // 锁忙直通
-            for &sample in data {
-                if producer.try_push(sample).is_err() {
-                    fell_behind = true;
-                }
-            }
-        }
-
-        if fell_behind {
-            log::warn!("Output buffer full");
-        }
+    // 1. 计算全频段 RMS
+    let rms = if data.is_empty() {
+        0.0
+    } else {
+        (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt()
     };
+
+    // 2. 用全频段 RMS 计算目标增益（和之前全频段模式一样灵敏）
+    let target_gain = if let Ok(l) = limiter_clone.try_lock() {
+        l.compute_target_gain(rms)
+    } else {
+        1.0
+    };
+
+    // 3. 逐采样进行侧链分频处理
+    if let Ok(mut limiter_guard) = limiter_clone.try_lock() {
+        for &sample in data {
+            let processed = limiter_guard.process_sample_multiband_with_gain(sample, target_gain);
+            if producer.try_push(processed).is_err() {
+                fell_behind = true;
+            }
+        }
+    } else {
+        for &sample in data {
+            if producer.try_push(sample).is_err() {
+                fell_behind = true;
+            }
+        }
+    }
+
+    if fell_behind {
+        log::warn!("Output buffer full");
+    }
+};
 
     // ----- 输出回调：用上一个有效值填充下溢，避免断点爆音 -----
     let output_data_fn = move |out_data: &mut [f32], _: &cpal::OutputCallbackInfo| {
