@@ -24,14 +24,20 @@ impl LoudnessLimiter {
         let threshold_db;
         let attack_ms;
         let release_ms;
-
-        {
-            let config = self.config.lock().unwrap();
-            threshold_db = config.threshold_db;
-            attack_ms = config.attack_ms as f32;
-            release_ms = config.release_ms as f32;
+       {
+            match self.config.try_lock() {
+                Ok(cfg) => {
+                    threshold_db = cfg.threshold_db;
+                    attack_ms = cfg.attack_ms as f32;
+                    release_ms = cfg.release_ms as f32;
+                }
+                Err(_) => {
+                    // 锁被占用或已中毒，直接用上一次计算出的增益值
+                    // 保证音频处理永不卡死、永不崩溃
+                    return self.current_gain;
+                }
+            }
         }
-
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f32();
         self.last_update = now;
