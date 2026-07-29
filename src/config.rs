@@ -40,6 +40,10 @@ pub struct Config {
 
     #[serde(default)]
     pub target_output_device_id: Option<String>,
+
+    // 新增：分频点 (Hz)
+    #[serde(default = "default_crossover_freq")]
+    pub crossover_freq: f32,
 }
 
 fn default_threshold() -> f32 {
@@ -62,6 +66,10 @@ fn default_volume_change_percentage_threshold() -> f32 {
     0.02
 }
 
+fn default_crossover_freq() -> f32 {
+    300.0
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -74,6 +82,7 @@ impl Default for Config {
             operation_mode: OperationMode::default(),
             target_input_device_id: None,
             target_output_device_id: None,
+            crossover_freq: default_crossover_freq(),
         }
     }
 }
