@@ -86,7 +86,7 @@ impl LoudnessLimiter {
     }
 
     pub fn process_sample_multiband(&mut self, sample: f32) -> f32 {
-        // 如果系数意外为0，直通全频段，并应用全频段降音（安全兜底）
+        // 安全兜底：系数异常时回退全频段降音
         if self.alpha <= 0.0 || self.high_attack_steps <= 0.0 {
             let rms = sample.abs();
             let gain = self.calculate_gain(rms, 1);
@@ -100,10 +100,12 @@ impl LoudnessLimiter {
 
         self.high_rms_smooth += self.rms_alpha * (high.abs() - self.high_rms_smooth);
 
+        // 高频阈值自动降低 6dB，让枪声更容易触发压缩
+        let effective_threshold = self.cached_threshold_db - 6.0;
         let target_high_gain = if self.high_rms_smooth > 1e-10 {
             let db = 20.0 * self.high_rms_smooth.log10();
-            if db > self.cached_threshold_db {
-                10_f32.powf(-(db - self.cached_threshold_db) / 20.0)
+            if db > effective_threshold {
+                10_f32.powf(-(db - effective_threshold) / 20.0)
             } else {
                 1.0
             }
@@ -111,6 +113,7 @@ impl LoudnessLimiter {
             1.0
         };
 
+        // 逐采样平滑（死区防抖）
         let step = if target_high_gain < self.high_gain {
             (self.high_gain - target_high_gain) / self.high_attack_steps.max(1.0)
         } else {
@@ -139,66 +142,64 @@ impl LoudnessLimiter {
     }
 
     pub fn calculate_gain(&mut self, input_rms: f32, num_samples: usize) -> f32 {
-    let input_rms = input_rms.max(1e-10);
-    let input_db = 20.0 * input_rms.log10();
-    let excess_db = input_db - self.cached_threshold_db;
+        let input_rms = input_rms.max(1e-10);
+        let input_db = 20.0 * input_rms.log10();
+        let excess_db = input_db - self.cached_threshold_db;
 
-    let target_gain = if excess_db > 0.0 {
-        10_f32.powf(-excess_db / 20.0)
-    } else {
-        1.0
-    };
-
-    let (attack_steps, release_steps) = (
-        self.cached_attack_ms / 1000.0 * self.sample_rate,
-        self.cached_release_ms / 1000.0 * self.sample_rate,
-    );
-
-    let step = if target_gain < self.current_gain {
-        (self.current_gain - target_gain) / attack_steps.max(1.0)
-    } else {
-        (target_gain - self.current_gain) / release_steps.max(1.0)
-    };
-
-    // 逐采样滑动增益，而不是整个帧用一个值
-    let mut gain = self.current_gain;
-    for _ in 0..num_samples {
-        if (gain - target_gain).abs() <= step {
-            gain = target_gain;
-            break;
-        }
-        if target_gain < gain {
-            gain -= step;
+        let target_gain = if excess_db > 0.0 {
+            10_f32.powf(-excess_db / 20.0)
         } else {
-            gain += step;
+            1.0
+        };
+
+        let (attack_steps, release_steps) = (
+            self.cached_attack_ms / 1000.0 * self.sample_rate,
+            self.cached_release_ms / 1000.0 * self.sample_rate,
+        );
+
+        let step = if target_gain < self.current_gain {
+            (self.current_gain - target_gain) / attack_steps.max(1.0)
+        } else {
+            (target_gain - self.current_gain) / release_steps.max(1.0)
+        };
+
+        let mut gain = self.current_gain;
+        for _ in 0..num_samples {
+            if (gain - target_gain).abs() <= step {
+                gain = target_gain;
+                break;
+            }
+            if target_gain < gain {
+                gain -= step;
+            } else {
+                gain += step;
+            }
         }
-    }
-    self.current_gain = gain;
-
-    // 返回本帧最后一个采样点的增益（也可以返回平均值，但相差极小）
-    self.current_gain
-}
-   pub fn smooth_step(&mut self, target_gain: f32) -> f32 {
-    let (attack_steps, release_steps) = (
-        self.cached_attack_ms / 1000.0 * self.sample_rate,
-        self.cached_release_ms / 1000.0 * self.sample_rate,
-    );
-
-    let step = if target_gain < self.current_gain {
-        (self.current_gain - target_gain) / attack_steps.max(1.0)
-    } else {
-        (target_gain - self.current_gain) / release_steps.max(1.0)
-    };
-
-    // 死区：差值小于步长时直接锁定目标，避免抖动
-    if (self.current_gain - target_gain).abs() <= step {
-        self.current_gain = target_gain;
-    } else if target_gain < self.current_gain {
-        self.current_gain -= step;
-    } else {
-        self.current_gain += step;
+        self.current_gain = gain;
+        self.current_gain
     }
 
-    self.current_gain
-}
+    pub fn smooth_step(&mut self, target_gain: f32) -> f32 {
+        let (attack_steps, release_steps) = (
+            self.cached_attack_ms / 1000.0 * self.sample_rate,
+            self.cached_release_ms / 1000.0 * self.sample_rate,
+        );
+
+        let step = if target_gain < self.current_gain {
+            (self.current_gain - target_gain) / attack_steps.max(1.0)
+        } else {
+            (target_gain - self.current_gain) / release_steps.max(1.0)
+        };
+
+        // 死区防抖
+        if (self.current_gain - target_gain).abs() <= step {
+            self.current_gain = target_gain;
+        } else if target_gain < self.current_gain {
+            self.current_gain -= step;
+        } else {
+            self.current_gain += step;
+        }
+
+        self.current_gain
+    }
 }
