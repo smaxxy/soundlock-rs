@@ -16,7 +16,7 @@ pub struct SettingsWindow {
     selected_input_idx: usize,
     selected_output_idx: usize,
     retry_start: bool,
-    retry_stop: bool,   // 新增：停止失败时的重试标志
+    retry_stop: bool,
 }
 
 impl SettingsWindow {
@@ -53,7 +53,7 @@ impl SettingsWindow {
             selected_input_idx,
             selected_output_idx,
             retry_start: false,
-            retry_stop: false,   // 初始 false
+            retry_stop: false,
         }
     }
 
@@ -136,6 +136,7 @@ impl SettingsWindow {
     }
 
     fn start_limiting(&mut self) {
+        // 第一步：读取并校验配置
         let (mode, pid, input_id, output_id) = {
             match self.config.try_lock() {
                 Ok(cfg) => {
@@ -153,6 +154,17 @@ impl SettingsWindow {
             }
         };
 
+        // 第二步：参数合法性校验
+        if mode == OperationMode::WindowsAPI && pid.is_none() {
+            log::warn!("Cannot start limiting: no application selected");
+            return;
+        }
+        if mode == OperationMode::Cable && (input_id.is_none() || output_id.is_none()) {
+            log::warn!("Cannot start limiting: no audio devices selected");
+            return;
+        }
+
+        // 第三步：设置运行状态
         match self.state.try_lock() {
             Ok(mut state) => {
                 state.is_limiting = true;
@@ -171,15 +183,7 @@ impl SettingsWindow {
 
         log::info!("Starting limiter");
 
-        if mode == OperationMode::WindowsAPI && pid.is_none() {
-            log::warn!("Cannot start limiting: no application selected");
-            return;
-        }
-        if mode == OperationMode::Cable && (input_id.is_none() || output_id.is_none()) {
-            log::warn!("Cannot start limiting: no audio devices selected");
-            return;
-        }
-
+        // 第四步：启动音频线程
         audio::start_limiter(Arc::clone(&self.state), Arc::clone(&self.config));
     }
 
@@ -188,15 +192,15 @@ impl SettingsWindow {
         match self.state.try_lock() {
             Ok(mut state) => {
                 state.is_limiting = false;
-                self.retry_stop = false;   // 成功则清除重试标志
+                self.retry_stop = false;
             }
             Err(std::sync::TryLockError::WouldBlock) => {
                 log::warn!("State lock busy, will retry stop next frame");
-                self.retry_stop = true;    // 设置重试标志
+                self.retry_stop = true;
             }
             Err(e) => {
                 log::error!("Failed to stop limiter: {:?}", e);
-                self.retry_stop = false;   // 中毒则放弃
+                self.retry_stop = false;
             }
         }
     }
@@ -206,12 +210,12 @@ impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.refresh_if_needed();
 
-        // 处理重试启动
+        // 重试启动
         if self.retry_start {
             self.start_limiting();
         }
 
-        // 处理重试停止
+        // 重试停止
         if self.retry_stop {
             self.stop_limiting();
         }
