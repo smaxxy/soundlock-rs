@@ -115,7 +115,7 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
     };
 
     // ★ 新增：将实际采样率告诉 limiter，保证时间常数准确
-    limiter.set_sample_rate(stream_config.sample_rate.0 as f32);
+    limiter.set_sample_rate(stream_config.sample_rate as f32);
 
     let latency_ms = 150.0f32;
     let latency_frames = (latency_ms / 1_000.0) * stream_config.sample_rate as f32;
@@ -243,10 +243,10 @@ fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config
     };
 
     let volume_ctrl = match VolumeController::for_process(target_pid) {
-        Ok(ctrl) => ctrl,
-        Err(e) => {
-            log::error!("Failed to create volume controller for PID {}: {}", target_pid, e);
-            return;
+    Some(ctrl) => ctrl,
+    None => {
+        log::error!("Failed to create volume controller for PID {}", target_pid);
+        return;
         }
     };
 
