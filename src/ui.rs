@@ -15,6 +15,8 @@ pub struct SettingsWindow {
     output_devices: Vec<(Device, String)>,   // (device, id_string)
     selected_input_idx: usize,
     selected_output_idx: usize,
+    // 新增：用于在 start_limiting 锁竞争时自动重试
+    retry_start: bool,
 }
 
 impl SettingsWindow {
@@ -50,6 +52,7 @@ impl SettingsWindow {
             output_devices,
             selected_input_idx,
             selected_output_idx,
+            retry_start: false,
         }
     }
 
@@ -66,7 +69,6 @@ impl SettingsWindow {
         }
     }
 
-    /// 返回设备列表和对应的 id 字符串（避免在 UI 中重复调用可能 panic 的方法）
     fn get_devices() -> (Vec<(Device, String)>, Vec<(Device, String)>) {
         let host = cpal::default_host();
 
@@ -75,10 +77,7 @@ impl SettingsWindow {
             .map(|devices| {
                 devices
                     .filter_map(|d| {
-                        d.id().ok().map(|id| {
-                            let id_str = id.to_string();
-                            (d, id_str)
-                        })
+                        d.id().ok().map(|id| (d, id.to_string()))
                     })
                     .collect()
             })
@@ -89,10 +88,7 @@ impl SettingsWindow {
             .map(|devices| {
                 devices
                     .filter_map(|d| {
-                        d.id().ok().map(|id| {
-                            let id_str = id.to_string();
-                            (d, id_str)
-                        })
+                        d.id().ok().map(|id| (d, id.to_string()))
                     })
                     .collect()
             })
@@ -101,15 +97,28 @@ impl SettingsWindow {
         (input_devices, output_devices)
     }
 
-    /// 定期刷新音频会话和设备列表（在 update 中调用）
+    /// 定期刷新设备列表和会话，并保持设备索引不变（根据已保存的id）
     fn refresh_if_needed(&mut self) {
         let now = std::time::Instant::now();
-        // 每 2 秒刷新一次
         if now.duration_since(self.last_refresh) > std::time::Duration::from_secs(2) {
             self.sessions = Self::enumerate_sessions();
             let (input, output) = Self::get_devices();
             self.input_devices = input;
             self.output_devices = output;
+
+            // 根据之前保存的设备id重新匹配索引，避免下拉框跳动
+            if let Ok(cfg) = self.config.try_lock() {
+                self.selected_input_idx = cfg
+                    .target_input_device_id
+                    .as_ref()
+                    .and_then(|id| find_device_index(&self.input_devices, id))
+                    .unwrap_or(usize::MAX);
+                self.selected_output_idx = cfg
+                    .target_output_device_id
+                    .as_ref()
+                    .and_then(|id| find_device_index(&self.output_devices, id))
+                    .unwrap_or(usize::MAX);
+            }
             self.last_refresh = now;
         }
     }
@@ -117,7 +126,6 @@ impl SettingsWindow {
     fn refresh_sessions(&mut self) {
         self.sessions = Self::enumerate_sessions();
         self.last_refresh = std::time::Instant::now();
-        log::debug!("Sessions refreshed");
     }
 
     fn save_config(&self, config: &Config) {
@@ -127,8 +135,7 @@ impl SettingsWindow {
         }
     }
 
-    /// 启动限幅：先获取配置并保存，然后更新状态，最后调用音频启动
-    fn start_limiting(&self) {
+    fn start_limiting(&mut self) {
         let (mode, pid, input_id, output_id) = {
             match self.config.try_lock() {
                 Ok(cfg) => {
@@ -136,21 +143,26 @@ impl SettingsWindow {
                     let pid = cfg.target_pid;
                     let input_id = cfg.target_input_device_id.clone();
                     let output_id = cfg.target_output_device_id.clone();
+                    // 启动前保存当前配置，确保固化
                     self.save_config(&*cfg);
                     (mode, pid, input_id, output_id)
                 }
                 Err(_) => {
-                    log::error!("Config lock poisoned, cannot start limiting");
+                    log::error!("Config lock poisoned");
                     return;
                 }
             }
         };
 
-        // 更新状态（使用 try_lock 避免死锁）
+        // 尝试更新状态
         match self.state.try_lock() {
-            Ok(mut state) => state.is_limiting = true,
+            Ok(mut state) => {
+                state.is_limiting = true;
+                self.retry_start = false; // 成功，清除重试标志
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
-                log::warn!("State lock busy, start will be retried");
+                log::warn!("State lock busy, will retry start next frame");
+                self.retry_start = true; // 下一帧自动重试
                 return;
             }
             Err(_) => {
@@ -179,7 +191,6 @@ impl SettingsWindow {
             Ok(mut state) => state.is_limiting = false,
             Err(std::sync::TryLockError::WouldBlock) => {
                 log::warn!("State lock busy, will retry stop next frame");
-                return;
             }
             Err(e) => log::error!("Failed to stop limiter: {:?}", e),
         }
@@ -188,10 +199,14 @@ impl SettingsWindow {
 
 impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // 定期刷新设备列表和会话
+        // 定期刷新设备和会话（并保持索引）
         self.refresh_if_needed();
 
-        // 读取运行状态（使用 try_lock）
+        // 如果有重试标志，尝试重新开始限幅
+        if self.retry_start {
+            self.start_limiting(); // start_limiting 内部会清除标志
+        }
+
         let is_limiting = match self.state.try_lock() {
             Ok(state) => state.is_limiting,
             Err(_) => {
@@ -200,25 +215,25 @@ impl eframe::App for SettingsWindow {
             }
         };
 
-        // 读取配置参数（使用局部变量，失败则跳过本帧）
+        // 读取配置参数（注意顺序已经修正）
         let (
-    mut threshold_db,
-    mut selected_pid,
-    mut attack_ms,
-    mut release_ms,
-    mut scan_interval_ms,
-    mut volume_change_percentage_threshold,  // 第6个，对应右边的 f32
-    mut operation_mode,                      // 第7个，对应右边的 OperationMode
-) = match self.config.try_lock() {
-    Ok(config) => (
-        config.threshold_db,
-        config.target_pid,
-        config.attack_ms,
-        config.release_ms,
-        config.scan_interval_ms,
-        config.volume_change_percentage_threshold,
-        config.operation_mode,
-    ),
+            mut threshold_db,
+            mut selected_pid,
+            mut attack_ms,
+            mut release_ms,
+            mut scan_interval_ms,
+            mut volume_change_percentage_threshold,   // f32
+            mut operation_mode,                        // OperationMode
+        ) = match self.config.try_lock() {
+            Ok(config) => (
+                config.threshold_db,
+                config.target_pid,
+                config.attack_ms,
+                config.release_ms,
+                config.scan_interval_ms,
+                config.volume_change_percentage_threshold,
+                config.operation_mode,
+            ),
             Err(_) => {
                 ctx.request_repaint();
                 return;
@@ -430,7 +445,7 @@ impl eframe::App for SettingsWindow {
                             }
                         }
 
-                        // 保存按钮：使用 try_lock 避免白屏
+                        // 手动保存按钮（保留用于强制保存）
                         if ui.add_sized(btn_size, Button::new("Save Config")).clicked() {
                             match self.config.try_lock() {
                                 Ok(cfg) => self.save_config(&*cfg),
@@ -450,7 +465,7 @@ impl eframe::App for SettingsWindow {
                 });
         });
 
-        // 写回配置，失败则下帧再试
+        // 写回配置，若发生变更则自动保存
         {
             let mut config = match self.config.try_lock() {
                 Ok(c) => c,
@@ -492,7 +507,7 @@ impl eframe::App for SettingsWindow {
                 changed = true;
             }
 
-            // 更新设备选择
+            // 设备选择变更
             let new_input_id = self
                 .input_devices
                 .get(self.selected_input_idx)
@@ -513,15 +528,14 @@ impl eframe::App for SettingsWindow {
                 changed = true;
             }
 
+            // 自动保存
             if changed {
-                drop(config); // 释放锁后再保存，避免死锁
-                // 如果需要立即保存，可以调用 self.save_config，这里仅记录变更
+                self.save_config(&*config);
             }
         }
     }
 }
 
-/// 在设备列表中查找指定 id 的索引（设备列表现在为 Vec<(Device, String)>）
 fn find_device_index(devices: &[(Device, String)], device_id: &str) -> Option<usize> {
     devices.iter().position(|(_, id)| id == device_id)
 }
