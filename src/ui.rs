@@ -11,8 +11,8 @@ pub struct SettingsWindow {
     config: Arc<Mutex<Config>>,
     sessions: Vec<SessionInfo>,
     last_refresh: std::time::Instant,
-    input_devices: Vec<Device>,
-    output_devices: Vec<Device>,
+    input_devices: Vec<(Device, String)>,    // (device, id_string)
+    output_devices: Vec<(Device, String)>,   // (device, id_string)
     selected_input_idx: usize,
     selected_output_idx: usize,
 }
@@ -20,24 +20,26 @@ pub struct SettingsWindow {
 impl SettingsWindow {
     pub fn new(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) -> Self {
         let sessions = Self::enumerate_sessions();
-
         let (input_devices, output_devices) = Self::get_devices();
 
-        let selected_input_idx;
-        let selected_output_idx;
-        {
-            let config = config.lock().unwrap();
-            selected_input_idx = config
-                .target_input_device_id
-                .as_ref()
-                .and_then(|id| find_device_index(&input_devices, id))
-                .unwrap_or(usize::MAX);
-            selected_output_idx = config
-                .target_output_device_id
-                .as_ref()
-                .and_then(|id| find_device_index(&output_devices, id))
-                .unwrap_or(usize::MAX);
-        }
+        let (selected_input_idx, selected_output_idx) = {
+            match config.try_lock() {
+                Ok(cfg) => (
+                    cfg.target_input_device_id
+                        .as_ref()
+                        .and_then(|id| find_device_index(&input_devices, id))
+                        .unwrap_or(usize::MAX),
+                    cfg.target_output_device_id
+                        .as_ref()
+                        .and_then(|id| find_device_index(&output_devices, id))
+                        .unwrap_or(usize::MAX),
+                ),
+                Err(_) => {
+                    log::error!("Config lock poisoned during init");
+                    (usize::MAX, usize::MAX)
+                }
+            }
+        };
 
         Self {
             state,
@@ -64,34 +66,52 @@ impl SettingsWindow {
         }
     }
 
-    fn get_devices() -> (Vec<Device>, Vec<Device>) {
+    /// 返回设备列表和对应的 id 字符串（避免在 UI 中重复调用可能 panic 的方法）
+    fn get_devices() -> (Vec<(Device, String)>, Vec<(Device, String)>) {
         let host = cpal::default_host();
 
-        let input_devices: Vec<Device> = host
+        let input_devices = host
             .input_devices()
-            .unwrap()
-            .filter(|d| {
-                if !(d.description().is_ok() && d.id().is_ok()) {
-                    log::warn!("Failed to get device description or ID in input_devices");
-                    return false;
-                }
-                true
+            .map(|devices| {
+                devices
+                    .filter_map(|d| {
+                        d.id().ok().map(|id| {
+                            let id_str = id.to_string();
+                            (d, id_str)
+                        })
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
-        let output_devices: Vec<Device> = host
+        let output_devices = host
             .output_devices()
-            .unwrap()
-            .filter(|d| {
-                if !(d.description().is_ok() && d.id().is_ok()) {
-                    log::warn!("Failed to get device description or ID in output_devices");
-                    return false;
-                }
-                true
+            .map(|devices| {
+                devices
+                    .filter_map(|d| {
+                        d.id().ok().map(|id| {
+                            let id_str = id.to_string();
+                            (d, id_str)
+                        })
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         (input_devices, output_devices)
+    }
+
+    /// 定期刷新音频会话和设备列表（在 update 中调用）
+    fn refresh_if_needed(&mut self) {
+        let now = std::time::Instant::now();
+        // 每 2 秒刷新一次
+        if now.duration_since(self.last_refresh) > std::time::Duration::from_secs(2) {
+            self.sessions = Self::enumerate_sessions();
+            let (input, output) = Self::get_devices();
+            self.input_devices = input;
+            self.output_devices = output;
+            self.last_refresh = now;
+        }
     }
 
     fn refresh_sessions(&mut self) {
@@ -107,23 +127,45 @@ impl SettingsWindow {
         }
     }
 
+    /// 启动限幅：先获取配置并保存，然后更新状态，最后调用音频启动
     fn start_limiting(&self) {
-        let config = self.config.lock().unwrap();
+        let (mode, pid, input_id, output_id) = {
+            match self.config.try_lock() {
+                Ok(cfg) => {
+                    let mode = cfg.operation_mode;
+                    let pid = cfg.target_pid;
+                    let input_id = cfg.target_input_device_id.clone();
+                    let output_id = cfg.target_output_device_id.clone();
+                    self.save_config(&*cfg);
+                    (mode, pid, input_id, output_id)
+                }
+                Err(_) => {
+                    log::error!("Config lock poisoned, cannot start limiting");
+                    return;
+                }
+            }
+        };
 
-        self.state.lock().unwrap().is_limiting = true;
-
-        self.save_config(&config);
+        // 更新状态（使用 try_lock 避免死锁）
+        match self.state.try_lock() {
+            Ok(mut state) => state.is_limiting = true,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                log::warn!("State lock busy, start will be retried");
+                return;
+            }
+            Err(_) => {
+                log::error!("State lock poisoned");
+                return;
+            }
+        }
 
         log::info!("Starting limiter");
 
-        if config.operation_mode == OperationMode::WindowsAPI && config.target_pid.is_none() {
+        if mode == OperationMode::WindowsAPI && pid.is_none() {
             log::warn!("Cannot start limiting: no application selected");
             return;
         }
-
-        if config.operation_mode == OperationMode::Cable
-            && (config.target_input_device_id.is_none() || config.target_output_device_id.is_none())
-        {
+        if mode == OperationMode::Cable && (input_id.is_none() || output_id.is_none()) {
             log::warn!("Cannot start limiting: no audio devices selected");
             return;
         }
@@ -133,32 +175,55 @@ impl SettingsWindow {
 
     fn stop_limiting(&self) {
         log::info!("Stopping limiter");
-
-        self.state.lock().unwrap().is_limiting = false;
+        match self.state.try_lock() {
+            Ok(mut state) => state.is_limiting = false,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                log::warn!("State lock busy, will retry stop next frame");
+                return;
+            }
+            Err(e) => log::error!("Failed to stop limiter: {:?}", e),
+        }
     }
 }
 
 impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        let is_limiting = self.state.lock().unwrap().is_limiting;
+        // 定期刷新设备列表和会话
+        self.refresh_if_needed();
 
-        let mut threshold_db;
-        let mut selected_pid;
-        let mut attack_ms;
-        let mut release_ms;
-        let mut scan_interval_ms;
-        let mut operation_mode;
-        let mut volume_change_percentage_threshold;
-        {
-            let config = self.config.lock().unwrap();
-            threshold_db = config.threshold_db;
-            selected_pid = config.target_pid;
-            attack_ms = config.attack_ms;
-            release_ms = config.release_ms;
-            scan_interval_ms = config.scan_interval_ms;
-            volume_change_percentage_threshold = config.volume_change_percentage_threshold;
-            operation_mode = config.operation_mode;
-        }
+        // 读取运行状态（使用 try_lock）
+        let is_limiting = match self.state.try_lock() {
+            Ok(state) => state.is_limiting,
+            Err(_) => {
+                ctx.request_repaint();
+                return;
+            }
+        };
+
+        // 读取配置参数（使用局部变量，失败则跳过本帧）
+        let (
+    mut threshold_db,
+    mut selected_pid,
+    mut attack_ms,
+    mut release_ms,
+    mut scan_interval_ms,
+    mut volume_change_percentage_threshold,  // 第6个，对应右边的 f32
+    mut operation_mode,                      // 第7个，对应右边的 OperationMode
+) = match self.config.try_lock() {
+    Ok(config) => (
+        config.threshold_db,
+        config.target_pid,
+        config.attack_ms,
+        config.release_ms,
+        config.scan_interval_ms,
+        config.volume_change_percentage_threshold,
+        config.operation_mode,
+    ),
+            Err(_) => {
+                ctx.request_repaint();
+                return;
+            }
+        };
 
         CentralPanel::default().show(ctx, |ui| {
             ScrollArea::vertical()
@@ -171,24 +236,18 @@ impl eframe::App for SettingsWindow {
 
                     ui.horizontal(|ui| {
                         ui.label("Status:");
-
                         let (color, text) = if is_limiting {
                             (Color32::from_rgb(0, 200, 0), "Active")
                         } else {
                             (Color32::GRAY, "Inactive")
                         };
-
                         ui.colored_label(color, text);
                     });
 
                     ui.separator();
 
                     ui.horizontal(|ui| {
-                        ui.radio_value(
-                            &mut operation_mode,
-                            OperationMode::WindowsAPI,
-                            "Windows API",
-                        );
+                        ui.radio_value(&mut operation_mode, OperationMode::WindowsAPI, "Windows API");
                         ui.radio_value(&mut operation_mode, OperationMode::Cable, "Cable");
                     });
 
@@ -200,24 +259,29 @@ impl eframe::App for SettingsWindow {
 
                             ui.horizontal(|ui| {
                                 ui.label("Input:");
-
                                 let selected_text = if self.selected_input_idx == usize::MAX {
-                                    "None"
+                                    "None".to_owned()
                                 } else {
-                                    &self.input_devices[self.selected_input_idx]
-                                        .description()
-                                        .unwrap()
-                                        .to_string()
+                                    self.input_devices
+                                        .get(self.selected_input_idx)
+                                        .and_then(|(d, _)| d.description().ok())
+                                        .map(|d| d.name().to_string())
+                                        .unwrap_or_else(|| "Unknown".to_string())
                                 };
 
                                 egui::ComboBox::from_id_salt("input_device_combo")
-                                    .selected_text(selected_text)
+                                    .selected_text(&selected_text)
                                     .show_ui(ui, |ui| {
-                                        for (idx, name) in self.input_devices.iter().enumerate() {
+                                        for (idx, (d, _)) in self.input_devices.iter().enumerate() {
+                                            let name = d
+                                                .description()
+                                                .ok()
+                                                .map(|desc| desc.name().to_string())
+                                                .unwrap_or_else(|| format!("Device {}", idx));
                                             ui.selectable_value(
                                                 &mut self.selected_input_idx,
                                                 idx,
-                                                name.description().unwrap().name(),
+                                                name,
                                             );
                                         }
                                     });
@@ -225,24 +289,29 @@ impl eframe::App for SettingsWindow {
 
                             ui.horizontal(|ui| {
                                 ui.label("Output:");
-
                                 let selected_text = if self.selected_output_idx == usize::MAX {
-                                    "None"
+                                    "None".to_owned()
                                 } else {
-                                    &self.output_devices[self.selected_output_idx]
-                                        .description()
-                                        .unwrap()
-                                        .to_string()
+                                    self.output_devices
+                                        .get(self.selected_output_idx)
+                                        .and_then(|(d, _)| d.description().ok())
+                                        .map(|d| d.name().to_string())
+                                        .unwrap_or_else(|| "Unknown".to_string())
                                 };
 
                                 egui::ComboBox::from_id_salt("output_device_combo")
-                                    .selected_text(selected_text)
+                                    .selected_text(&selected_text)
                                     .show_ui(ui, |ui| {
-                                        for (idx, name) in self.output_devices.iter().enumerate() {
+                                        for (idx, (d, _)) in self.output_devices.iter().enumerate() {
+                                            let name = d
+                                                .description()
+                                                .ok()
+                                                .map(|desc| desc.name().to_string())
+                                                .unwrap_or_else(|| format!("Device {}", idx));
                                             ui.selectable_value(
                                                 &mut self.selected_output_idx,
                                                 idx,
-                                                name.description().unwrap().name(),
+                                                name,
                                             );
                                         }
                                     });
@@ -250,7 +319,6 @@ impl eframe::App for SettingsWindow {
                         });
                     } else {
                         ui.label("Select Application to Limit:");
-
                         ui.horizontal(|ui| {
                             if ui.button("Refresh List").clicked() {
                                 self.refresh_sessions();
@@ -259,29 +327,16 @@ impl eframe::App for SettingsWindow {
 
                         ui.group(|ui| {
                             ui.set_min_height(150.0);
-
                             ScrollArea::vertical().show(ui, |ui| {
                                 if self.sessions.is_empty() {
-                                    ui.label(
-                                    "No audio sessions found. Make sure an app is playing audio.",
-                                );
+                                    ui.label("No audio sessions found. Make sure an app is playing audio.");
                                 }
-
                                 for session in &self.sessions {
                                     let is_selected = selected_pid == Some(session.pid);
-
                                     ui.horizontal(|ui| {
-                                        let response = ui.radio_value(
-                                            &mut selected_pid,
-                                            Some(session.pid),
-                                            "",
-                                        );
-
-                                        ui.label(format!(
-                                            "{} (PID: {})",
-                                            session.name, session.pid
-                                        ));
-
+                                        let response =
+                                            ui.radio_value(&mut selected_pid, Some(session.pid), "");
+                                        ui.label(format!("{} (PID: {})", session.name, session.pid));
                                         if is_selected {
                                             response.highlight();
                                         }
@@ -294,64 +349,54 @@ impl eframe::App for SettingsWindow {
                     ui.separator();
 
                     ui.label("Maximum Loudness Threshold:");
-
                     ui.horizontal(|ui| {
                         ui.add(
                             Slider::new(&mut threshold_db, -60.0..=0.0)
                                 .text("dB")
                                 .max_decimals(1),
                         );
-
                         ui.label(format!("{:.1} dB", threshold_db));
                     });
 
                     ui.separator();
 
                     ui.label("Attack Time:");
-
                     ui.horizontal(|ui| {
                         ui.add(
                             Slider::new(&mut attack_ms, 1..=300)
                                 .text("ms")
                                 .max_decimals(0),
                         );
-
-                        ui.label(format!("{:} ms", attack_ms));
+                        ui.label(format!("{} ms", attack_ms));
                     });
 
                     ui.label("Release Time:");
-
                     ui.horizontal(|ui| {
                         ui.add(
                             Slider::new(&mut release_ms, 1..=300)
                                 .text("ms")
                                 .max_decimals(0),
                         );
-
-                        ui.label(format!("{:} ms", release_ms));
+                        ui.label(format!("{} ms", release_ms));
                     });
 
                     if operation_mode == OperationMode::WindowsAPI {
                         ui.label("Volume Scan Interval:");
-
                         ui.horizontal(|ui| {
                             ui.add(
                                 Slider::new(&mut scan_interval_ms, 1..=300)
                                     .text("ms")
                                     .max_decimals(0),
                             );
-
-                            ui.label(format!("{:} ms", scan_interval_ms));
+                            ui.label(format!("{} ms", scan_interval_ms));
                         });
 
                         ui.label("Volume Change Percentage Threshold:");
-
                         ui.horizontal(|ui| {
                             ui.add(
                                 Slider::new(&mut volume_change_percentage_threshold, 0.01..=0.10)
                                     .max_decimals(3),
                             );
-
                             ui.label(format!("{:.3}", volume_change_percentage_threshold));
                         });
                     }
@@ -366,9 +411,8 @@ impl eframe::App for SettingsWindow {
                                 btn_size,
                                 Button::new("Start Limiting").fill(Color32::from_rgb(0, 150, 0)),
                             );
-
                             if start_btn.clicked() {
-                                if selected_pid.is_some() {
+                                if selected_pid.is_some() || operation_mode == OperationMode::Cable {
                                     self.start_limiting();
                                 } else {
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(
@@ -381,19 +425,21 @@ impl eframe::App for SettingsWindow {
                                 btn_size,
                                 Button::new("Stop").fill(Color32::from_rgb(200, 0, 0)),
                             );
-
                             if stop_btn.clicked() {
                                 self.stop_limiting();
                             }
                         }
 
+                        // 保存按钮：使用 try_lock 避免白屏
                         if ui.add_sized(btn_size, Button::new("Save Config")).clicked() {
-                            self.save_config(&self.config.lock().unwrap());
+                            match self.config.try_lock() {
+                                Ok(cfg) => self.save_config(&*cfg),
+                                Err(_) => log::error!("Cannot save config: lock poisoned"),
+                            }
                         }
                     });
 
                     ui.separator();
-
                     ui.add_space(15.0);
 
                     ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
@@ -404,54 +450,78 @@ impl eframe::App for SettingsWindow {
                 });
         });
 
+        // 写回配置，失败则下帧再试
         {
-            let mut config = self.config.lock().unwrap();
+            let mut config = match self.config.try_lock() {
+                Ok(c) => c,
+                Err(_) => {
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+
+            let mut changed = false;
+
             if threshold_db != config.threshold_db {
                 config.threshold_db = threshold_db;
+                changed = true;
             }
             if selected_pid != config.target_pid {
                 config.target_pid = selected_pid;
+                changed = true;
             }
             if attack_ms != config.attack_ms {
                 config.attack_ms = attack_ms;
+                changed = true;
             }
             if release_ms != config.release_ms {
                 config.release_ms = release_ms;
+                changed = true;
             }
             if scan_interval_ms != config.scan_interval_ms {
                 config.scan_interval_ms = scan_interval_ms;
+                changed = true;
             }
             if volume_change_percentage_threshold != config.volume_change_percentage_threshold {
                 config.volume_change_percentage_threshold = volume_change_percentage_threshold;
+                changed = true;
             }
             if operation_mode != config.operation_mode {
                 config.operation_mode = operation_mode;
                 self.stop_limiting();
+                changed = true;
             }
-            if let Some(id) = self
+
+            // 更新设备选择
+            let new_input_id = self
                 .input_devices
                 .get(self.selected_input_idx)
-                .map(|d| d.id().unwrap().to_string())
-                .filter(|id| config.target_input_device_id.as_ref() != Some(id))
-            {
-                config.target_input_device_id = Some(id);
+                .map(|(_, id)| id.clone());
+            if new_input_id != config.target_input_device_id {
+                config.target_input_device_id = new_input_id;
                 self.stop_limiting();
+                changed = true;
             }
-            if let Some(id) = self
+
+            let new_output_id = self
                 .output_devices
                 .get(self.selected_output_idx)
-                .map(|d| d.id().unwrap().to_string())
-                .filter(|id| config.target_output_device_id.as_ref() != Some(id))
-            {
-                config.target_output_device_id = Some(id);
+                .map(|(_, id)| id.clone());
+            if new_output_id != config.target_output_device_id {
+                config.target_output_device_id = new_output_id;
                 self.stop_limiting();
+                changed = true;
+            }
+
+            if changed {
+                drop(config); // 释放锁后再保存，避免死锁
+                // 如果需要立即保存，可以调用 self.save_config，这里仅记录变更
             }
         }
     }
 }
 
-fn find_device_index(devices: &[Device], device_id: &str) -> Option<usize> {
-    devices
-        .iter()
-        .position(|d| d.id().unwrap().to_string() == device_id)
+/// 在设备列表中查找指定 id 的索引（设备列表现在为 Vec<(Device, String)>）
+fn find_device_index(devices: &[(Device, String)], device_id: &str) -> Option<usize> {
+    devices.iter().position(|(_, id)| id == device_id)
 }
