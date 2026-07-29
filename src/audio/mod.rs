@@ -39,9 +39,10 @@ pub fn start_limiter(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
 }
 
 fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
-    let mut limiter = LoudnessLimiter::new(Arc::clone(&config));
+    // 用 Arc<Mutex<>> 包装，使闭包和主循环都能访问
+    let limiter = Arc::new(Mutex::new(LoudnessLimiter::new(Arc::clone(&config))));
 
-    // 安全获取设备 ID（与之前相同）
+    // 安全获取设备 ID
     let (input_device_id, output_device_id) = match config.try_lock() {
         Ok(cfg) => (
             cfg.target_input_device_id.clone(),
@@ -114,8 +115,10 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
         }
     };
 
-    // ★ 新增：将实际采样率告诉 limiter，保证时间常数准确
-    limiter.set_sample_rate(stream_config.sample_rate as f32);
+    // 设置采样率到 limiter
+    if let Ok(mut l) = limiter.lock() {
+        l.set_sample_rate(stream_config.sample_rate as f32);
+    }
 
     let latency_ms = 150.0f32;
     let latency_frames = (latency_ms / 1_000.0) * stream_config.sample_rate as f32;
@@ -128,6 +131,8 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
         let _ = producer.try_push(0.0);
     }
 
+    // 为闭包准备 limiter 克隆
+    let limiter_clone = Arc::clone(&limiter);
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         let mut fell_behind = false;
 
@@ -137,8 +142,12 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
             (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt()
         };
 
-        // ★ 改动：调用新的 calculate_gain，传入本帧采样数，实现帧级平滑
-        let gain = limiter.calculate_gain(rms, data.len());
+        // 安全获取增益，若锁忙则用 1.0（不衰减）
+        let gain = if let Ok(mut l) = limiter_clone.try_lock() {
+            l.calculate_gain(rms, data.len())
+        } else {
+            1.0
+        };
 
         for &sample in data {
             if producer.try_push(sample * gain).is_err() {
@@ -198,7 +207,7 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
         return;
     }
 
-    // 主循环：安全等待停止信号
+    // 主循环：安全等待停止信号，定期更新参数
     loop {
         let should_continue = loop {
             match state.try_lock() {
@@ -214,8 +223,10 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
             break;
         }
 
-        // ★ 新增：定期更新缓存的阈值、attack/release 等参数，不会阻塞音频回调
-        limiter.update_parameters();
+        // 安全更新参数
+        if let Ok(mut l) = limiter.lock() {
+            l.update_parameters();
+        }
 
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -226,7 +237,8 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
 }
 
 fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
-    let mut limiter = LoudnessLimiter::new(Arc::clone(&config));
+    // 使用 Arc<Mutex<>> 保持一致性（虽然 WinAPI 闭包不需要 move，但为简单也用）
+    let limiter = Arc::new(Mutex::new(LoudnessLimiter::new(Arc::clone(&config))));
 
     let target_pid = match config.try_lock() {
         Ok(cfg) => match cfg.target_pid {
@@ -243,13 +255,15 @@ fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config
     };
 
     let volume_ctrl = match VolumeController::for_process(target_pid) {
-    Some(ctrl) => ctrl,
-    None => {
-        log::error!("Failed to create volume controller for PID {}", target_pid);
-        return;
+        Some(ctrl) => ctrl,
+        None => {
+            log::error!("Failed to create volume controller for PID {}", target_pid);
+            return;
         }
     };
 
+    // 记录原始音量作为固定基准，不再使用 get_volume
+    let original_volume = volume_ctrl.get_original_volume();
     let mut last_gain = 0.0f32;
 
     loop {
@@ -278,12 +292,15 @@ fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config
         };
 
         if let Ok(rms) = volume_ctrl.get_current_rms() {
-            // ★ 修改：使用 compute_target_gain 获取瞬时目标增益（WinAPI 模式不做采样级平滑）
-            let target_gain = limiter.compute_target_gain(rms);
+            // 计算目标增益（使用 calculate_gain 或者简单的计算，避免依赖缺失的 compute_target_gain）
+            let target_gain = if let Ok(mut l) = limiter.try_lock() {
+                // 使用 calculate_gain 获取平滑后的增益（传 1 个采样点忽略平滑）
+                l.calculate_gain(rms, 1)
+            } else {
+                last_gain
+            };
 
-            // 简单的时间平滑：每次更新只移动一定比例
             let gain = if (last_gain - target_gain).abs() > volume_change_percentage_threshold {
-                // 向 target 移动 (这里沿用之前简单的直接设置，因为阈值判断已做)
                 target_gain
             } else {
                 last_gain
@@ -291,13 +308,9 @@ fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config
 
             if gain != last_gain {
                 last_gain = gain;
-                if let Ok(current_vol) = volume_ctrl.get_volume() {
-                    let target_volume = (current_vol * gain).clamp(0.0, 1.0);
-                    if let Err(e) = volume_ctrl.set_volume(target_volume) {
-                        log::error!("Failed to set volume: {}", e);
-                    }
-                } else {
-                    log::error!("Failed to get current volume");
+                let target_volume = (original_volume * gain).clamp(0.0, 1.0);
+                if let Err(e) = volume_ctrl.set_volume(target_volume) {
+                    log::error!("Failed to set volume: {}", e);
                 }
             }
         }
@@ -305,5 +318,8 @@ fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config
         std::thread::sleep(Duration::from_millis(scan_interval_ms as u64));
     }
 
-    log::info!("Limiter stopped, volume remains at current level");
+    log::info!("Restoring original volume: {:.2}", original_volume);
+    if let Err(e) = volume_ctrl.restore() {
+        log::error!("Failed to restore volume: {}", e);
+    }
 }
