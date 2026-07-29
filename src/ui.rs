@@ -208,14 +208,14 @@ impl eframe::App for SettingsWindow {
             let mut fonts = egui::FontDefinitions::default();
             if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\msyh.ttc") {
                 fonts.font_data.insert("MicrosoftYaHei".to_owned(), 
-                    egui::FontData::from_owned(font_data));
+                    egui::FontData::from_owned(font_data).into());
                 fonts.families.entry(egui::FontFamily::Proportional)
                     .or_default()
                     .insert(0, "MicrosoftYaHei".to_owned());
                 ctx.set_fonts(fonts);
             } else if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\simsun.ttc") {
                 fonts.font_data.insert("SimSun".to_owned(), 
-                    egui::FontData::from_owned(font_data));
+                    egui::FontData::from_owned(font_data).into());
                 fonts.families.entry(egui::FontFamily::Proportional)
                     .or_default()
                     .insert(0, "SimSun".to_owned());
