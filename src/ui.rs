@@ -17,6 +17,7 @@ pub struct SettingsWindow {
     selected_output_idx: usize,
     retry_start: bool,
     retry_stop: bool,
+    fonts_loaded: bool,   // 新加：中文字体加载标志
 }
 
 impl SettingsWindow {
@@ -54,6 +55,7 @@ impl SettingsWindow {
             selected_output_idx,
             retry_start: false,
             retry_stop: false,
+            fonts_loaded: false,   // 初始未加载
         }
     }
 
@@ -106,7 +108,6 @@ impl SettingsWindow {
             self.input_devices = input;
             self.output_devices = output;
 
-            // 根据已保存的设备 id 恢复选中索引
             if let Ok(cfg) = self.config.try_lock() {
                 self.selected_input_idx = cfg
                     .target_input_device_id
@@ -136,7 +137,6 @@ impl SettingsWindow {
     }
 
     fn start_limiting(&mut self) {
-        // 第一步：读取并校验配置
         let (mode, pid, input_id, output_id) = {
             match self.config.try_lock() {
                 Ok(cfg) => {
@@ -154,7 +154,6 @@ impl SettingsWindow {
             }
         };
 
-        // 第二步：参数合法性校验
         if mode == OperationMode::WindowsAPI && pid.is_none() {
             log::warn!("Cannot start limiting: no application selected");
             return;
@@ -164,7 +163,6 @@ impl SettingsWindow {
             return;
         }
 
-        // 第三步：设置运行状态
         match self.state.try_lock() {
             Ok(mut state) => {
                 state.is_limiting = true;
@@ -182,8 +180,6 @@ impl SettingsWindow {
         }
 
         log::info!("Starting limiter");
-
-        // 第四步：启动音频线程
         audio::start_limiter(Arc::clone(&self.state), Arc::clone(&self.config));
     }
 
@@ -208,6 +204,33 @@ impl SettingsWindow {
 
 impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // === 首次加载中文字体，解决中文显示为方框的问题 ===
+        if !self.fonts_loaded {
+            let mut fonts = egui::FontDefinitions::default();
+            // 尝试系统自带的微软雅黑（Windows 通用）
+            if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\msyh.ttc") {
+                fonts.font_data.insert("MicrosoftYaHei".to_owned(), 
+                    egui::FontData::from_owned(font_data));
+                fonts.families.entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "MicrosoftYaHei".to_owned());
+                ctx.set_fonts(fonts);
+            } else {
+                // 如果找不到微软雅黑，可以尝试其他字体（如宋体）
+                if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\simsun.ttc") {
+                    fonts.font_data.insert("SimSun".to_owned(), 
+                        egui::FontData::from_owned(font_data));
+                    fonts.families.entry(egui::FontFamily::Proportional)
+                        .or_default()
+                        .insert(0, "SimSun".to_owned());
+                    ctx.set_fonts(fonts);
+                } else {
+                    log::warn!("未找到中文字体，中文可能仍显示为方框");
+                }
+            }
+            self.fonts_loaded = true;
+        }
+
         self.refresh_if_needed();
 
         // 重试启动
@@ -542,7 +565,7 @@ impl eframe::App for SettingsWindow {
             if changed {
                 self.save_config(&*config);
             }
-        } // config 锁在此释放
+        }
 
         if need_stop {
             self.stop_limiting();
