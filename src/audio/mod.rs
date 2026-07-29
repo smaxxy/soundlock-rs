@@ -41,7 +41,7 @@ pub fn start_limiter(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
 fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
     let mut limiter = LoudnessLimiter::new(Arc::clone(&config));
 
-    // 安全获取设备 ID
+    // 安全获取设备 ID（与之前相同）
     let (input_device_id, output_device_id) = match config.try_lock() {
         Ok(cfg) => (
             cfg.target_input_device_id.clone(),
@@ -114,6 +114,9 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
         }
     };
 
+    // ★ 新增：将实际采样率告诉 limiter，保证时间常数准确
+    limiter.set_sample_rate(stream_config.sample_rate.0 as f32);
+
     let latency_ms = 150.0f32;
     let latency_frames = (latency_ms / 1_000.0) * stream_config.sample_rate as f32;
     let latency_samples = (latency_frames as usize) * stream_config.channels as usize;
@@ -128,13 +131,14 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         let mut fell_behind = false;
 
-        // 防止空切片导致除以零
         let rms = if data.is_empty() {
             0.0
         } else {
             (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt()
         };
-        let gain = limiter.calculate_gain(rms);
+
+        // ★ 改动：调用新的 calculate_gain，传入本帧采样数，实现帧级平滑
+        let gain = limiter.calculate_gain(rms, data.len());
 
         for &sample in data {
             if producer.try_push(sample * gain).is_err() {
@@ -209,6 +213,10 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
         if !should_continue {
             break;
         }
+
+        // ★ 新增：定期更新缓存的阈值、attack/release 等参数，不会阻塞音频回调
+        limiter.update_parameters();
+
         std::thread::sleep(Duration::from_secs(1));
     }
 
@@ -270,29 +278,32 @@ fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config
         };
 
         if let Ok(rms) = volume_ctrl.get_current_rms() {
-            let gain = limiter.calculate_gain(rms);
+            // ★ 修改：使用 compute_target_gain 获取瞬时目标增益（WinAPI 模式不做采样级平滑）
+            let target_gain = limiter.compute_target_gain(rms);
 
-            if (last_gain - gain).abs() <= volume_change_percentage_threshold {
-                std::thread::sleep(Duration::from_millis(scan_interval_ms as u64));
-                continue;
-            }
-
-            last_gain = gain;
-
-            // 动态获取当前音量作为基准，避免手动调整音量后偏差
-            if let Ok(current_vol) = volume_ctrl.get_volume() {
-                let target_volume = (current_vol * gain).clamp(0.0, 1.0);
-                if let Err(e) = volume_ctrl.set_volume(target_volume) {
-                    log::error!("Failed to set volume: {}", e);
-                }
+            // 简单的时间平滑：每次更新只移动一定比例
+            let gain = if (last_gain - target_gain).abs() > volume_change_percentage_threshold {
+                // 向 target 移动 (这里沿用之前简单的直接设置，因为阈值判断已做)
+                target_gain
             } else {
-                log::error!("Failed to get current volume");
+                last_gain
+            };
+
+            if gain != last_gain {
+                last_gain = gain;
+                if let Ok(current_vol) = volume_ctrl.get_volume() {
+                    let target_volume = (current_vol * gain).clamp(0.0, 1.0);
+                    if let Err(e) = volume_ctrl.set_volume(target_volume) {
+                        log::error!("Failed to set volume: {}", e);
+                    }
+                } else {
+                    log::error!("Failed to get current volume");
+                }
             }
         }
 
         std::thread::sleep(Duration::from_millis(scan_interval_ms as u64));
     }
 
-    // 不再调用 restore，因为我们已经动态跟随系统音量，停止后用户当前音量即为最终值
     log::info!("Limiter stopped, volume remains at current level");
 }
