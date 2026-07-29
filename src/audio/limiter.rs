@@ -72,14 +72,24 @@ impl LoudnessLimiter {
 
     /// 定期调用，用 try_lock 安全刷新缓存参数，并重新计算系数
     pub fn update_parameters(&mut self) {
-        if let Ok(cfg) = self.config.try_lock() {
-            self.cached_threshold_db = cfg.threshold_db;
-            self.cached_attack_ms = cfg.attack_ms as f32;
-            self.cached_release_ms = cfg.release_ms as f32;
-            self.cached_crossover_freq = cfg.crossover_freq;
-            self.recalc_filter_coeffs();
+    let (threshold, attack, release, crossover) = {
+        match self.config.try_lock() {
+            Ok(cfg) => (
+                cfg.threshold_db,
+                cfg.attack_ms as f32,
+                cfg.release_ms as f32,
+                cfg.crossover_freq,
+            ),
+            Err(_) => return, // 拿不到锁就跳过本次更新
         }
-    }
+    }; // 锁在这里释放
+
+    self.cached_threshold_db = threshold;
+    self.cached_attack_ms = attack;
+    self.cached_release_ms = release;
+    self.cached_crossover_freq = crossover;
+    self.recalc_filter_coeffs();
+}
 
     /// 重新计算滤波器系数及平滑步进值
     fn recalc_filter_coeffs(&mut self) {
