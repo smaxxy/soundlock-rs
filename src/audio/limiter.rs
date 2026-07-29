@@ -31,33 +31,38 @@ pub struct LoudnessLimiter {
 
 impl LoudnessLimiter {
     pub fn new(config: Arc<Mutex<Config>>) -> Self {
-        let (threshold, attack, release, crossover) = match config.try_lock() {
-            Ok(cfg) => (
-                cfg.threshold_db,
-                cfg.attack_ms as f32,
-                cfg.release_ms as f32,
-                cfg.crossover_freq,
-            ),
-            Err(_) => (-20.0, 10.0, 50.0, 300.0),
-        };
-        Self {
-            config,
-            current_gain: 1.0,
-            cached_threshold_db: threshold,
-            cached_attack_ms: attack,
-            cached_release_ms: release,
-            cached_crossover_freq: crossover,
-            sample_rate: 44100.0, // 临时默认，会被 mod.rs 正确设置
-            hp_x1: 0.0,
-            hp_y1: 0.0,
-            high_rms_smooth: 0.0,
-            high_gain: 1.0,
-            high_attack_steps: 0.0,
-            high_release_steps: 0.0,
-            alpha: 0.0,
-            rms_alpha: 0.0,
-        }
-    }
+    let (threshold, attack, release, crossover) = match config.try_lock() {
+        Ok(cfg) => (
+            cfg.threshold_db,
+            cfg.attack_ms as f32,
+            cfg.release_ms as f32,
+            cfg.crossover_freq,
+        ),
+        Err(_) => (-20.0, 10.0, 50.0, 300.0),
+    };
+
+    let mut limiter = Self {
+        config,
+        current_gain: 1.0,
+        cached_threshold_db: threshold,
+        cached_attack_ms: attack,
+        cached_release_ms: release,
+        cached_crossover_freq: crossover,
+        sample_rate: 44100.0,
+        hp_x1: 0.0,
+        hp_y1: 0.0,
+        high_rms_smooth: 0.0,
+        high_gain: 1.0,
+        high_attack_steps: 0.0,
+        high_release_steps: 0.0,
+        alpha: 0.0,
+        rms_alpha: 0.0,
+    };
+
+    // 立刻用默认采样率计算滤波系数，确保功能立即可用
+    limiter.recalc_filter_coeffs();
+    limiter
+}
 
     /// 由音频流启动后调用，设置实际采样率，并重新计算所有相关系数
     pub fn set_sample_rate(&mut self, rate: f32) {
