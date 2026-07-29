@@ -49,7 +49,15 @@ impl LoudnessLimiter {
             self.cached_release_ms = cfg.release_ms as f32;
         }
     }
-
+    pub fn compute_target_gain(&self, rms: f32) -> f32 {
+        let rms = rms.max(1e-10);
+        let db = 20.0 * rms.log10();
+        if db > self.cached_threshold_db {
+            10_f32.powf(-(db - self.cached_threshold_db) / 20.0)
+        } else {
+            1.0
+        }
+    }
     /// 计算当前帧的平滑增益
     /// `rms`       : 当前帧的 RMS 值
     /// `num_samples` : 本帧包含的采样数
