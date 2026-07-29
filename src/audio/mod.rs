@@ -94,32 +94,43 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
 
     let limiter_clone = Arc::clone(&limiter);
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        let mut fell_behind = false;
+    let mut fell_behind = false;
 
-        // 计算全频段 RMS
-        let rms = if data.is_empty() {
-            0.0
-        } else {
-            (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt()
-        };
+    // 计算本帧的 RMS
+    let rms = if data.is_empty() {
+        0.0
+    } else {
+        (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt()
+    };
 
-        // 使用全频段平滑增益（不是分频）
-        let gain = if let Ok(mut l) = limiter_clone.try_lock() {
-            l.calculate_gain(rms, data.len())
-        } else {
-            1.0
-        };
+    // 计算目标增益（瞬时增益，不做平滑）
+    let target_gain = if let Ok(l) = limiter_clone.try_lock() {
+        l.compute_target_gain(rms)
+    } else {
+        1.0
+    };
 
+    // 逐采样平滑并应用
+    if let Ok(mut l) = limiter_clone.try_lock() {
         for &sample in data {
+            let gain = l.smooth_step(target_gain);
             if producer.try_push(sample * gain).is_err() {
                 fell_behind = true;
             }
         }
-        if fell_behind {
-            log::warn!("Output buffer full");
+    } else {
+        // 锁忙直通
+        for &sample in data {
+            if producer.try_push(sample).is_err() {
+                fell_behind = true;
+            }
         }
-    };
+    }
 
+    if fell_behind {
+        log::warn!("Output buffer full");
+    }
+};
     let output_data_fn = move |out_data: &mut [f32], _: &cpal::OutputCallbackInfo| {
         let mut fell_behind = false;
         for sample in out_data.iter_mut() {
