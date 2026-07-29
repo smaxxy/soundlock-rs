@@ -130,7 +130,34 @@ impl LoudnessLimiter {
 
         low + high * self.high_gain
     }
+pub fn process_sample_multiband_with_gain(&mut self, sample: f32, target_gain: f32) -> f32 {
+    // 安全兜底
+    if self.alpha <= 0.0 || self.high_attack_steps <= 0.0 {
+        let gain = self.smooth_step(target_gain);
+        return sample * gain;
+    }
 
+    let high = self.alpha * (self.hp_y1 + sample - self.hp_x1);
+    self.hp_x1 = sample;
+    self.hp_y1 = high;
+    let low = sample - high;
+
+    // 高频增益平滑
+    let step = if target_gain < self.high_gain {
+        (self.high_gain - target_gain) / self.high_attack_steps.max(1.0)
+    } else {
+        (target_gain - self.high_gain) / self.high_release_steps.max(1.0)
+    };
+    if (self.high_gain - target_gain).abs() <= step {
+        self.high_gain = target_gain;
+    } else if target_gain < self.high_gain {
+        self.high_gain -= step;
+    } else {
+        self.high_gain += step;
+    }
+
+    low + high * self.high_gain
+}
     pub fn compute_target_gain(&self, rms: f32) -> f32 {
         let rms = rms.max(1e-10);
         let db = 20.0 * rms.log10();
