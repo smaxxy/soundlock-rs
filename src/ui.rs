@@ -476,7 +476,8 @@ impl eframe::App for SettingsWindow {
                 });
         });
 
-        // 写回配置，变更时自动保存
+        // 写回配置，变更时自动保存（已修复借用冲突）
+        let mut need_stop = false;
         {
             let mut config = match self.config.try_lock() {
                 Ok(c) => c,
@@ -514,7 +515,7 @@ impl eframe::App for SettingsWindow {
             }
             if operation_mode != config.operation_mode {
                 config.operation_mode = operation_mode;
-                self.stop_limiting();
+                need_stop = true;
                 changed = true;
             }
 
@@ -524,7 +525,7 @@ impl eframe::App for SettingsWindow {
                 .map(|(_, id)| id.clone());
             if new_input_id != config.target_input_device_id {
                 config.target_input_device_id = new_input_id;
-                self.stop_limiting();
+                need_stop = true;
                 changed = true;
             }
 
@@ -534,13 +535,17 @@ impl eframe::App for SettingsWindow {
                 .map(|(_, id)| id.clone());
             if new_output_id != config.target_output_device_id {
                 config.target_output_device_id = new_output_id;
-                self.stop_limiting();
+                need_stop = true;
                 changed = true;
             }
 
             if changed {
                 self.save_config(&*config);
             }
+        } // config 锁在此释放
+
+        if need_stop {
+            self.stop_limiting();
         }
     }
 }
