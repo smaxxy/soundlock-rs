@@ -15,8 +15,8 @@ pub struct SettingsWindow {
     output_devices: Vec<(Device, String)>,   // (device, id_string)
     selected_input_idx: usize,
     selected_output_idx: usize,
-    // 新增：用于在 start_limiting 锁竞争时自动重试
     retry_start: bool,
+    retry_stop: bool,   // 新增：停止失败时的重试标志
 }
 
 impl SettingsWindow {
@@ -53,6 +53,7 @@ impl SettingsWindow {
             selected_input_idx,
             selected_output_idx,
             retry_start: false,
+            retry_stop: false,   // 初始 false
         }
     }
 
@@ -97,7 +98,6 @@ impl SettingsWindow {
         (input_devices, output_devices)
     }
 
-    /// 定期刷新设备列表和会话，并保持设备索引不变（根据已保存的id）
     fn refresh_if_needed(&mut self) {
         let now = std::time::Instant::now();
         if now.duration_since(self.last_refresh) > std::time::Duration::from_secs(2) {
@@ -106,7 +106,7 @@ impl SettingsWindow {
             self.input_devices = input;
             self.output_devices = output;
 
-            // 根据之前保存的设备id重新匹配索引，避免下拉框跳动
+            // 根据已保存的设备 id 恢复选中索引
             if let Ok(cfg) = self.config.try_lock() {
                 self.selected_input_idx = cfg
                     .target_input_device_id
@@ -143,7 +143,6 @@ impl SettingsWindow {
                     let pid = cfg.target_pid;
                     let input_id = cfg.target_input_device_id.clone();
                     let output_id = cfg.target_output_device_id.clone();
-                    // 启动前保存当前配置，确保固化
                     self.save_config(&*cfg);
                     (mode, pid, input_id, output_id)
                 }
@@ -154,15 +153,14 @@ impl SettingsWindow {
             }
         };
 
-        // 尝试更新状态
         match self.state.try_lock() {
             Ok(mut state) => {
                 state.is_limiting = true;
-                self.retry_start = false; // 成功，清除重试标志
+                self.retry_start = false;
             }
             Err(std::sync::TryLockError::WouldBlock) => {
                 log::warn!("State lock busy, will retry start next frame");
-                self.retry_start = true; // 下一帧自动重试
+                self.retry_start = true;
                 return;
             }
             Err(_) => {
@@ -185,26 +183,37 @@ impl SettingsWindow {
         audio::start_limiter(Arc::clone(&self.state), Arc::clone(&self.config));
     }
 
-    fn stop_limiting(&self) {
+    fn stop_limiting(&mut self) {
         log::info!("Stopping limiter");
         match self.state.try_lock() {
-            Ok(mut state) => state.is_limiting = false,
+            Ok(mut state) => {
+                state.is_limiting = false;
+                self.retry_stop = false;   // 成功则清除重试标志
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
                 log::warn!("State lock busy, will retry stop next frame");
+                self.retry_stop = true;    // 设置重试标志
             }
-            Err(e) => log::error!("Failed to stop limiter: {:?}", e),
+            Err(e) => {
+                log::error!("Failed to stop limiter: {:?}", e);
+                self.retry_stop = false;   // 中毒则放弃
+            }
         }
     }
 }
 
 impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // 定期刷新设备和会话（并保持索引）
         self.refresh_if_needed();
 
-        // 如果有重试标志，尝试重新开始限幅
+        // 处理重试启动
         if self.retry_start {
-            self.start_limiting(); // start_limiting 内部会清除标志
+            self.start_limiting();
+        }
+
+        // 处理重试停止
+        if self.retry_stop {
+            self.stop_limiting();
         }
 
         let is_limiting = match self.state.try_lock() {
@@ -215,15 +224,14 @@ impl eframe::App for SettingsWindow {
             }
         };
 
-        // 读取配置参数（注意顺序已经修正）
         let (
             mut threshold_db,
             mut selected_pid,
             mut attack_ms,
             mut release_ms,
             mut scan_interval_ms,
-            mut volume_change_percentage_threshold,   // f32
-            mut operation_mode,                        // OperationMode
+            mut volume_change_percentage_threshold,
+            mut operation_mode,
         ) = match self.config.try_lock() {
             Ok(config) => (
                 config.threshold_db,
@@ -445,7 +453,6 @@ impl eframe::App for SettingsWindow {
                             }
                         }
 
-                        // 手动保存按钮（保留用于强制保存）
                         if ui.add_sized(btn_size, Button::new("Save Config")).clicked() {
                             match self.config.try_lock() {
                                 Ok(cfg) => self.save_config(&*cfg),
@@ -465,7 +472,7 @@ impl eframe::App for SettingsWindow {
                 });
         });
 
-        // 写回配置，若发生变更则自动保存
+        // 写回配置，变更时自动保存
         {
             let mut config = match self.config.try_lock() {
                 Ok(c) => c,
@@ -507,7 +514,6 @@ impl eframe::App for SettingsWindow {
                 changed = true;
             }
 
-            // 设备选择变更
             let new_input_id = self
                 .input_devices
                 .get(self.selected_input_idx)
@@ -528,7 +534,6 @@ impl eframe::App for SettingsWindow {
                 changed = true;
             }
 
-            // 自动保存
             if changed {
                 self.save_config(&*config);
             }
