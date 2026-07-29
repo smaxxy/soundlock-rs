@@ -1,0 +1,26 @@
+name: 自动打包Windows EXE
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 编译正式版EXE
+        run: cargo build --release
+
+      - name: 压缩exe
+        run: Compress-Archive target/release/soundlock-rs.exe 修复版软件.zip
+
+      - name: 保存打包文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: 软件压缩包
+          path: 修复版软件.zip
