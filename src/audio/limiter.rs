@@ -178,7 +178,7 @@ impl LoudnessLimiter {
     // 返回本帧最后一个采样点的增益（也可以返回平均值，但相差极小）
     self.current_gain
 }
-    pub fn smooth_step(&mut self, target_gain: f32) -> f32 {
+   pub fn smooth_step(&mut self, target_gain: f32) -> f32 {
     let (attack_steps, release_steps) = (
         self.cached_attack_ms / 1000.0 * self.sample_rate,
         self.cached_release_ms / 1000.0 * self.sample_rate,
@@ -190,6 +190,7 @@ impl LoudnessLimiter {
         (target_gain - self.current_gain) / release_steps.max(1.0)
     };
 
+    // 死区：差值小于步长时直接锁定目标，避免抖动
     if (self.current_gain - target_gain).abs() <= step {
         self.current_gain = target_gain;
     } else if target_gain < self.current_gain {
