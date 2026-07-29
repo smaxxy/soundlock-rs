@@ -20,72 +20,120 @@ pub fn start_limiter(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
     std::thread::spawn(move || {
         log::info!("Audio limiter thread started");
 
-        if config.lock().unwrap().operation_mode == OperationMode::Cable {
-            run_limiter_loop_cable(Arc::clone(&state), Arc::clone(&config));
+        let mode = match config.try_lock() {
+            Ok(cfg) => cfg.operation_mode,
+            Err(_) => {
+                log::error!("Config lock poisoned, stopping limiter thread");
+                return;
+            }
+        };
+
+        if mode == OperationMode::Cable {
+            run_limiter_loop_cable(state, config);
         } else {
-            run_limiter_loop_winapi(Arc::clone(&state), Arc::clone(&config));
+            run_limiter_loop_winapi(state, config);
         }
 
         log::info!("Audio limiter thread stopped");
     });
 }
 
-// we just assume that the input and output devices are selected and available
-// or crash.
 fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
     let mut limiter = LoudnessLimiter::new(Arc::clone(&config));
 
+    // 安全获取设备 ID
+    let (input_device_id, output_device_id) = match config.try_lock() {
+        Ok(cfg) => (
+            cfg.target_input_device_id.clone(),
+            cfg.target_output_device_id.clone(),
+        ),
+        Err(_) => {
+            log::error!("Config lock poisoned, cannot read device IDs");
+            return;
+        }
+    };
+
+    let input_device_id = match input_device_id {
+        Some(id) => id,
+        None => {
+            log::error!("No input device selected");
+            return;
+        }
+    };
+    let output_device_id = match output_device_id {
+        Some(id) => id,
+        None => {
+            log::error!("No output device selected");
+            return;
+        }
+    };
+
     let host = cpal::default_host();
-    let input_device = host
-        .input_devices()
-        .unwrap()
-        .find(|d| {
-            d.id().unwrap().to_string()
-                == *config
-                    .lock()
-                    .unwrap()
-                    .target_input_device_id
-                    .as_ref()
-                    .unwrap()
-                    .to_string()
-        })
-        .unwrap();
 
-    let output_device = host
-        .output_devices()
-        .unwrap()
-        .find(|d| {
-            d.id().unwrap().to_string()
-                == *config
-                    .lock()
-                    .unwrap()
-                    .target_output_device_id
-                    .as_ref()
-                    .unwrap()
-                    .to_string()
-        })
-        .unwrap();
+    let input_devices = match host.input_devices() {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("Failed to get input devices: {}", e);
+            return;
+        }
+    };
 
-    let config: StreamConfig = input_device
-        .default_input_config()
-        .expect("Failed to get input config")
-        .into();
+    let output_devices = match host.output_devices() {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("Failed to get output devices: {}", e);
+            return;
+        }
+    };
+
+    let input_device = match input_devices.into_iter().find(|d| {
+        d.id().ok().map(|id| id.to_string() == input_device_id).unwrap_or(false)
+    }) {
+        Some(d) => d,
+        None => {
+            log::error!("Input device not found (maybe unplugged)");
+            return;
+        }
+    };
+
+    let output_device = match output_devices.into_iter().find(|d| {
+        d.id().ok().map(|id| id.to_string() == output_device_id).unwrap_or(false)
+    }) {
+        Some(d) => d,
+        None => {
+            log::error!("Output device not found (maybe unplugged)");
+            return;
+        }
+    };
+
+    let stream_config: StreamConfig = match input_device.default_input_config() {
+        Ok(cfg) => cfg.into(),
+        Err(e) => {
+            log::error!("Failed to get input config: {}", e);
+            return;
+        }
+    };
 
     let latency_ms = 150.0f32;
-    let latency_frames = (latency_ms / 1_000.0) * config.sample_rate as f32;
-    let latency_samples = (latency_frames as usize) * config.channels as usize;
+    let latency_frames = (latency_ms / 1_000.0) * stream_config.sample_rate as f32;
+    let latency_samples = (latency_frames as usize) * stream_config.channels as usize;
 
     let ring = HeapRb::<f32>::new(latency_samples * 2);
     let (mut producer, mut consumer) = ring.split();
 
     for _ in 0..latency_samples {
-        producer.try_push(0.0).unwrap();
+        let _ = producer.try_push(0.0);
     }
 
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         let mut fell_behind = false;
 
-        let rms = (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt();
+        // 防止空切片导致除以零
+        let rms = if data.is_empty() {
+            0.0
+        } else {
+            (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt()
+        };
         let gain = limiter.calculate_gain(rms);
 
         for &sample in data {
@@ -118,21 +166,49 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
 
     let err_fn = |err| log::error!("Stream error: {}", err);
 
-    log::info!("Building streams with config: {:?}", config);
+    log::info!("Building streams with config: {:?}", stream_config);
 
-    let input_stream = input_device
-        .build_input_stream(&config, input_data_fn, err_fn, None)
-        .expect("Failed to build input stream");
+    let input_stream = match input_device.build_input_stream(&stream_config, input_data_fn, err_fn, None) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to build input stream: {}", e);
+            return;
+        }
+    };
 
-    let output_stream = output_device
-        .build_output_stream(&config, output_data_fn, err_fn, None)
-        .expect("Failed to build output stream");
+    let output_stream = match output_device.build_output_stream(&stream_config, output_data_fn, err_fn, None) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to build output stream: {}", e);
+            return;
+        }
+    };
 
     log::info!("Starting streams with {}ms latency", latency_ms);
-    input_stream.play().expect("Failed to start input stream");
-    output_stream.play().expect("Failed to start output stream");
+    if let Err(e) = input_stream.play() {
+        log::error!("Failed to start input stream: {}", e);
+        return;
+    }
+    if let Err(e) = output_stream.play() {
+        log::error!("Failed to start output stream: {}", e);
+        return;
+    }
 
-    while state.lock().unwrap().is_limiting {
+    // 主循环：安全等待停止信号
+    loop {
+        let should_continue = loop {
+            match state.try_lock() {
+                Ok(s) => break s.is_limiting,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break false,
+            }
+        };
+        if !should_continue {
+            break;
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
 
@@ -143,43 +219,80 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
 
 fn run_limiter_loop_winapi(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
     let mut limiter = LoudnessLimiter::new(Arc::clone(&config));
-    let volume_ctrl =
-        VolumeController::for_process(config.lock().unwrap().target_pid.unwrap()).unwrap();
 
-    let original_volume = volume_ctrl.get_original_volume();
+    let target_pid = match config.try_lock() {
+        Ok(cfg) => match cfg.target_pid {
+            Some(pid) => pid,
+            None => {
+                log::error!("No target PID configured for Windows API mode");
+                return;
+            }
+        },
+        Err(_) => {
+            log::error!("Config lock poisoned, cannot read PID");
+            return;
+        }
+    };
 
-    let mut last_gain = 0f32;
+    let volume_ctrl = match VolumeController::for_process(target_pid) {
+        Ok(ctrl) => ctrl,
+        Err(e) => {
+            log::error!("Failed to create volume controller for PID {}: {}", target_pid, e);
+            return;
+        }
+    };
+
+    let mut last_gain = 0.0f32;
 
     loop {
-        if !state.lock().unwrap().is_limiting {
+        let should_continue = loop {
+            match state.try_lock() {
+                Ok(s) => break s.is_limiting,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break false,
+            }
+        };
+        if !should_continue {
             break;
         }
 
-        let scan_interval_ms;
-        let volume_change_percentage_threshold;
-
-        {
-            let config = config.lock().unwrap();
-            scan_interval_ms = config.scan_interval_ms;
-            volume_change_percentage_threshold = config.volume_change_percentage_threshold;
-        }
+        let (scan_interval_ms, volume_change_percentage_threshold) = {
+            match config.try_lock() {
+                Ok(cfg) => (cfg.scan_interval_ms, cfg.volume_change_percentage_threshold),
+                Err(_) => {
+                    log::error!("Config lock poisoned, stopping Windows API limiter");
+                    break;
+                }
+            }
+        };
 
         if let Ok(rms) = volume_ctrl.get_current_rms() {
             let gain = limiter.calculate_gain(rms);
 
-            if (last_gain - gain).abs() > volume_change_percentage_threshold {
-                last_gain = gain;
-            } else {
+            if (last_gain - gain).abs() <= volume_change_percentage_threshold {
+                std::thread::sleep(Duration::from_millis(scan_interval_ms as u64));
                 continue;
             }
 
-            let target_volume = (original_volume * gain).clamp(0.0, 1.0);
-            volume_ctrl.set_volume(target_volume).unwrap();
+            last_gain = gain;
+
+            // 动态获取当前音量作为基准，避免手动调整音量后偏差
+            if let Ok(current_vol) = volume_ctrl.get_volume() {
+                let target_volume = (current_vol * gain).clamp(0.0, 1.0);
+                if let Err(e) = volume_ctrl.set_volume(target_volume) {
+                    log::error!("Failed to set volume: {}", e);
+                }
+            } else {
+                log::error!("Failed to get current volume");
+            }
         }
 
         std::thread::sleep(Duration::from_millis(scan_interval_ms as u64));
     }
 
-    log::info!("Restoring original volume: {:.2}", original_volume);
-    volume_ctrl.restore().unwrap();
+    // 不再调用 restore，因为我们已经动态跟随系统音量，停止后用户当前音量即为最终值
+    log::info!("Limiter stopped, volume remains at current level");
 }
