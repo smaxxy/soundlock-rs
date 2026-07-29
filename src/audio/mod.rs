@@ -132,15 +132,25 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
     }
 };
     let output_data_fn = move |out_data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        let mut fell_behind = false;
-        for sample in out_data.iter_mut() {
-            *sample = match consumer.try_pop() {
-                Some(s) => s,
-                None => { fell_behind = true; 0.0 }
-            };
-        }
-        if fell_behind { log::warn!("Input buffer empty"); }
-    };
+    let mut fell_behind = false;
+    let mut last_sample = 0.0f32; // 新增
+
+    for sample in out_data.iter_mut() {
+        *sample = match consumer.try_pop() {
+            Some(s) => {
+                last_sample = s;
+                s
+            }
+            None => {
+                fell_behind = true;
+                last_sample // 平滑延续，不突然跳到 0
+            }
+        };
+    }
+    if fell_behind {
+        log::warn!("Input buffer empty");
+    }
+};
 
     let err_fn = |err| log::error!("Stream error: {}", err);
 
