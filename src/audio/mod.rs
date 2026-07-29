@@ -1,3 +1,4 @@
+// 文件：src/audio/mod.rs
 pub mod limiter;
 pub mod session;
 pub mod volume;
@@ -78,6 +79,7 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
         Err(e) => { log::error!("Failed to get input config: {}", e); return; }
     };
 
+    // 设置采样率（全频段模式也需要）
     if let Ok(mut l) = limiter.lock() {
         l.set_sample_rate(stream_config.sample_rate as f32);
     }
@@ -93,20 +95,24 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
     let limiter_clone = Arc::clone(&limiter);
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         let mut fell_behind = false;
-        // 关键：逐采样调用多频段处理
-        if let Ok(mut limiter_guard) = limiter_clone.try_lock() {
-            for &sample in data {
-                let processed = limiter_guard.process_sample_multiband(sample);
-                if producer.try_push(processed).is_err() {
-                    fell_behind = true;
-                }
-            }
+
+        // 计算全频段 RMS
+        let rms = if data.is_empty() {
+            0.0
         } else {
-            // 锁忙时直通
-            for &sample in data {
-                if producer.try_push(sample).is_err() {
-                    fell_behind = true;
-                }
+            (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt()
+        };
+
+        // 使用全频段平滑增益（不是分频）
+        let gain = if let Ok(mut l) = limiter_clone.try_lock() {
+            l.calculate_gain(rms, data.len())
+        } else {
+            1.0
+        };
+
+        for &sample in data {
+            if producer.try_push(sample * gain).is_err() {
+                fell_behind = true;
             }
         }
         if fell_behind {
