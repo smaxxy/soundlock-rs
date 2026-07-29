@@ -1,4 +1,3 @@
-// 文件：src/audio/mod.rs
 pub mod limiter;
 pub mod session;
 pub mod volume;
@@ -79,7 +78,6 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
         Err(e) => { log::error!("Failed to get input config: {}", e); return; }
     };
 
-    // 设置采样率（全频段模式也需要）
     if let Ok(mut l) = limiter.lock() {
         l.set_sample_rate(stream_config.sample_rate as f32);
     }
@@ -93,64 +91,54 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
     for _ in 0..latency_samples { let _ = producer.try_push(0.0); }
 
     let limiter_clone = Arc::clone(&limiter);
+
+    // ----- 输入回调：逐采样调用多频段处理（分频限幅）-----
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-    let mut fell_behind = false;
+        let mut fell_behind = false;
 
-    // 计算本帧的 RMS
-    let rms = if data.is_empty() {
-        0.0
-    } else {
-        (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt()
-    };
-
-    // 计算目标增益（瞬时增益，不做平滑）
-    let target_gain = if let Ok(l) = limiter_clone.try_lock() {
-        l.compute_target_gain(rms)
-    } else {
-        1.0
-    };
-
-    // 逐采样平滑并应用
-    if let Ok(mut l) = limiter_clone.try_lock() {
-        for &sample in data {
-            let gain = l.smooth_step(target_gain);
-            if producer.try_push(sample * gain).is_err() {
-                fell_behind = true;
+        if let Ok(mut limiter_guard) = limiter_clone.try_lock() {
+            for &sample in data {
+                let processed = limiter_guard.process_sample_multiband(sample);
+                if producer.try_push(processed).is_err() {
+                    fell_behind = true;
+                }
+            }
+        } else {
+            // 锁忙直通
+            for &sample in data {
+                if producer.try_push(sample).is_err() {
+                    fell_behind = true;
+                }
             }
         }
-    } else {
-        // 锁忙直通
-        for &sample in data {
-            if producer.try_push(sample).is_err() {
-                fell_behind = true;
-            }
-        }
-    }
 
-    if fell_behind {
-        log::warn!("Output buffer full");
-    }
-};
+        if fell_behind {
+            log::warn!("Output buffer full");
+        }
+    };
+
+    // ----- 输出回调：用上一个有效值填充下溢，避免断点爆音 -----
     let output_data_fn = move |out_data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-    let mut fell_behind = false;
-    let mut last_sample = 0.0f32; // 新增
+        let mut fell_behind = false;
+        let mut last_sample = 0.0f32;
 
-    for sample in out_data.iter_mut() {
-        *sample = match consumer.try_pop() {
-            Some(s) => {
-                last_sample = s;
-                s
-            }
-            None => {
-                fell_behind = true;
-                last_sample // 平滑延续，不突然跳到 0
-            }
-        };
-    }
-    if fell_behind {
-        log::warn!("Input buffer empty");
-    }
-};
+        for sample in out_data.iter_mut() {
+            *sample = match consumer.try_pop() {
+                Some(s) => {
+                    last_sample = s;
+                    s
+                }
+                None => {
+                    fell_behind = true;
+                    last_sample // 平滑延续
+                }
+            };
+        }
+
+        if fell_behind {
+            log::warn!("Input buffer empty");
+        }
+    };
 
     let err_fn = |err| log::error!("Stream error: {}", err);
 
@@ -179,9 +167,11 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
             }
         };
         if !should_continue { break; }
+
         if let Ok(mut l) = limiter.lock() {
             l.update_parameters();
         }
+
         std::thread::sleep(Duration::from_secs(1));
     }
 
