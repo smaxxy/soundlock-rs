@@ -15,7 +15,6 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-
 pub fn start_limiter(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
     std::thread::spawn(move || {
         log::info!("Audio limiter thread started");
