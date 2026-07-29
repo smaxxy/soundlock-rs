@@ -139,36 +139,43 @@ impl LoudnessLimiter {
     }
 
     pub fn calculate_gain(&mut self, input_rms: f32, num_samples: usize) -> f32 {
-        let input_rms = input_rms.max(1e-10);
-        let input_db = 20.0 * input_rms.log10();
-        let excess_db = input_db - self.cached_threshold_db;
-        let target_gain = if excess_db > 0.0 {
-            10_f32.powf(-excess_db / 20.0)
-        } else {
-            1.0
-        };
-        let (attack_samples, release_samples) = (
-            self.cached_attack_ms / 1000.0 * self.sample_rate,
-            self.cached_release_ms / 1000.0 * self.sample_rate,
-        );
-        let step = if target_gain < self.current_gain {
-            (self.current_gain - target_gain) / attack_samples.max(1.0)
-        } else {
-            (target_gain - self.current_gain) / release_samples.max(1.0)
-        };
-        let mut gain = self.current_gain;
-        for _ in 0..num_samples {
-            if (gain - target_gain).abs() <= step {
-                gain = target_gain;
-                break;
-            }
-            if target_gain < gain {
-                gain -= step;
-            } else {
-                gain += step;
-            }
+    let input_rms = input_rms.max(1e-10);
+    let input_db = 20.0 * input_rms.log10();
+    let excess_db = input_db - self.cached_threshold_db;
+
+    let target_gain = if excess_db > 0.0 {
+        10_f32.powf(-excess_db / 20.0)
+    } else {
+        1.0
+    };
+
+    let (attack_steps, release_steps) = (
+        self.cached_attack_ms / 1000.0 * self.sample_rate,
+        self.cached_release_ms / 1000.0 * self.sample_rate,
+    );
+
+    let step = if target_gain < self.current_gain {
+        (self.current_gain - target_gain) / attack_steps.max(1.0)
+    } else {
+        (target_gain - self.current_gain) / release_steps.max(1.0)
+    };
+
+    // 逐采样滑动增益，而不是整个帧用一个值
+    let mut gain = self.current_gain;
+    for _ in 0..num_samples {
+        if (gain - target_gain).abs() <= step {
+            gain = target_gain;
+            break;
         }
-        self.current_gain = gain;
-        self.current_gain
+        if target_gain < gain {
+            gain -= step;
+        } else {
+            gain += step;
+        }
     }
+    self.current_gain = gain;
+
+    // 返回本帧最后一个采样点的增益（也可以返回平均值，但相差极小）
+    self.current_gain
+}
 }
