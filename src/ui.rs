@@ -252,6 +252,7 @@ impl eframe::App for SettingsWindow {
             mut scan_interval_ms,
             mut volume_change_percentage_threshold,
             mut operation_mode,
+            mut crossover_freq,   // 新增
         ) = match self.config.try_lock() {
             Ok(config) => (
                 config.threshold_db,
@@ -261,6 +262,7 @@ impl eframe::App for SettingsWindow {
                 config.scan_interval_ms,
                 config.volume_change_percentage_threshold,
                 config.operation_mode,
+                config.crossover_freq,
             ),
             Err(_) => {
                 ctx.request_repaint();
@@ -359,6 +361,18 @@ impl eframe::App for SettingsWindow {
                                         }
                                     });
                             });
+                        });
+
+                        // 分频点滑块（仅 Cable 模式显示）
+                        ui.separator();
+                        ui.label("分频点（低音保留频率）：");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                Slider::new(&mut crossover_freq, 100.0..=900.0)
+                                    .text("Hz")
+                                    .max_decimals(0),
+                            );
+                            ui.label(format!("{:.0} Hz", crossover_freq));
                         });
                     } else {
                         ui.label("选择要限制音量的应用：");
@@ -532,6 +546,10 @@ impl eframe::App for SettingsWindow {
             if operation_mode != config.operation_mode {
                 config.operation_mode = operation_mode;
                 need_stop = true;
+                changed = true;
+            }
+            if crossover_freq != config.crossover_freq {
+                config.crossover_freq = crossover_freq;
                 changed = true;
             }
 
