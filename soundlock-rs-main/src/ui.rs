@@ -1,4 +1,3 @@
-
 use crate::config::{Config, LimiterMode, OperationMode};
 use crate::{AppState, audio};
 use cpal::Device;
@@ -9,7 +8,6 @@ use std::sync::{Arc, Mutex};
 pub struct SettingsWindow {
     state: Arc<Mutex<AppState>>,
     config: Arc<Mutex<Config>>,
-    last_refresh: std::time::Instant,
     input_devices: Vec<(Device, String)>,
     output_devices: Vec<(Device, String)>,
     selected_input_idx: usize,
@@ -17,47 +15,45 @@ pub struct SettingsWindow {
     retry_start: bool,
     retry_stop: bool,
     fonts_loaded: bool,
+    last_retry_start: std::time::Instant,
+    last_retry_stop: std::time::Instant,
+    last_refresh_click: std::time::Instant,
+
+    pending_devices: Arc<Mutex<Option<(Vec<(Device, String)>, Vec<(Device, String)>)>>>,
+
+    last_save_time: std::time::Instant,
+    pending_save: bool,
 }
 
 impl SettingsWindow {
     pub fn new(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) -> Self {
-
-        let (input_devices, output_devices) = Self::get_devices();
-
-        let (selected_input_idx, selected_output_idx) = {
-            match config.try_lock() {
-                Ok(cfg) => (
-                    cfg.target_input_device_id
-                        .as_ref()
-                        .and_then(|id| find_device_index(&input_devices, id))
-                        .unwrap_or(usize::MAX),
-                    cfg.target_output_device_id
-                        .as_ref()
-                        .and_then(|id| find_device_index(&output_devices, id))
-                        .unwrap_or(usize::MAX),
-                ),
-                Err(_) => {
-                    log::error!("Config lock poisoned during init");
-                    (usize::MAX, usize::MAX)
-                }
+        let pending_devices = Arc::new(Mutex::new(None));
+        let pending_clone = Arc::clone(&pending_devices);
+        std::thread::spawn(move || {
+            let devices = Self::get_devices();
+            if let Ok(mut guard) = pending_clone.lock() {
+                *guard = Some(devices);
             }
-        };
+        });
 
         Self {
             state,
             config,
-            last_refresh: std::time::Instant::now(),
-            input_devices,
-            output_devices,
-            selected_input_idx,
-            selected_output_idx,
+            input_devices: Vec::new(),
+            output_devices: Vec::new(),
+            selected_input_idx: usize::MAX,
+            selected_output_idx: usize::MAX,
             retry_start: false,
             retry_stop: false,
             fonts_loaded: false,
+            last_retry_start: std::time::Instant::now(),
+            last_retry_stop: std::time::Instant::now(),
+            last_refresh_click: std::time::Instant::now(),
+            pending_devices,
+            last_save_time: std::time::Instant::now(),
+            pending_save: false,
         }
     }
-
-
 
     fn get_devices() -> (Vec<(Device, String)>, Vec<(Device, String)>) {
         let host = cpal::default_host();
@@ -80,29 +76,6 @@ impl SettingsWindow {
         (input_devices, output_devices)
     }
 
-    fn refresh_if_needed(&mut self) {
-        let now = std::time::Instant::now();
-        if now.duration_since(self.last_refresh) > std::time::Duration::from_secs(2) {
-  
-            let (input, output) = Self::get_devices();
-            self.input_devices = input;
-            self.output_devices = output;
-            self.update_selected_indices();
-            self.last_refresh = now;
-        }
-    }
-
-    fn refresh_devices(&mut self) {
-        let (input, output) = Self::get_devices();
-        self.input_devices = input;
-        self.output_devices = output;
-        self.update_selected_indices();
-        self.last_refresh = std::time::Instant::now();
-    }
-
-    fn refresh_sessions(&mut self) {
-        self.last_refresh = std::time::Instant::now();
-    }
 
     fn update_selected_indices(&mut self) {
         if let Ok(cfg) = self.config.try_lock() {
@@ -119,30 +92,31 @@ impl SettingsWindow {
         }
     }
 
-    fn save_config(&self, config: &Config) {
-        if let Err(e) = config.save() {
-            log::error!("Failed to save config: {}", e);
-        }
+    fn save_config(config: Config) {
+        std::thread::spawn(move || {
+            if let Err(e) = config.save() {
+                log::error!("Failed to save config: {}", e);
+            }
+        });
     }
 
-    fn start_limiting(&mut self) {
-        let (mode, pid, input_id, output_id) = {
+    fn start_limiting(&mut self, ctx: &Context) {
+        let (mode, _pid, input_id, output_id) = {
             match self.config.try_lock() {
-                Ok(cfg) => {
-                    let mode = cfg.operation_mode;
-                    let pid = cfg.target_pid;
-                    let input_id = cfg.target_input_device_id.clone();
-                    let output_id = cfg.target_output_device_id.clone();
-                    (mode, pid, input_id, output_id)
-                }
+                Ok(cfg) => (
+                    cfg.operation_mode,
+                    cfg.target_pid,
+                    cfg.target_input_device_id.clone(),
+                    cfg.target_output_device_id.clone(),
+                ),
                 Err(_) => {
                     log::error!("Config lock poisoned");
+                    self.retry_start = true;
                     return;
                 }
             }
         };
 
-      
         if mode == OperationMode::Cable && (input_id.is_none() || output_id.is_none()) {
             log::warn!("Cannot start limiting: no audio devices selected");
             return;
@@ -154,7 +128,6 @@ impl SettingsWindow {
                 self.retry_start = false;
             }
             Err(std::sync::TryLockError::WouldBlock) => {
-                log::warn!("State lock busy, will retry start next frame");
                 self.retry_start = true;
                 return;
             }
@@ -164,7 +137,14 @@ impl SettingsWindow {
             }
         }
 
-        audio::start_limiter(Arc::clone(&self.state), Arc::clone(&self.config));
+        let state = Arc::clone(&self.state);
+        let config = Arc::clone(&self.config);
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            audio::start_limiter(state, config);
+            ctx.request_repaint();
+        });
     }
 
     fn stop_limiting(&mut self) {
@@ -174,7 +154,6 @@ impl SettingsWindow {
                 self.retry_stop = false;
             }
             Err(std::sync::TryLockError::WouldBlock) => {
-                log::warn!("State lock busy, will retry stop next frame");
                 self.retry_stop = true;
             }
             Err(e) => {
@@ -183,11 +162,37 @@ impl SettingsWindow {
             }
         }
     }
+
+    fn on_exit_save(&mut self) {
+        if self.pending_save {
+            if let Ok(cfg) = self.config.try_lock() {
+                Self::save_config(cfg.clone());
+            }
+            self.pending_save = false;
+        }
+    }
 }
 
 impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // 字体加载（仅一次）
+        let devices_updated = {
+            if let Ok(mut pending) = self.pending_devices.try_lock() {
+                if let Some((input, output)) = pending.take() {
+                    self.input_devices = input;
+                    self.output_devices = output;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if devices_updated {
+            self.update_selected_indices();
+            ctx.request_repaint();
+        }
+
         if !self.fonts_loaded {
             let mut fonts = egui::FontDefinitions::default();
             if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\msyh.ttc") {
@@ -216,13 +221,14 @@ impl eframe::App for SettingsWindow {
             self.fonts_loaded = true;
         }
 
-        self.refresh_if_needed();
-
-        if self.retry_start {
-            self.start_limiting();
+        let now = std::time::Instant::now();
+        if self.retry_start && now.duration_since(self.last_retry_start) > std::time::Duration::from_secs(1) {
+            self.start_limiting(ctx);
+            self.last_retry_start = now;
         }
-        if self.retry_stop {
+        if self.retry_stop && now.duration_since(self.last_retry_stop) > std::time::Duration::from_secs(1) {
             self.stop_limiting();
+            self.last_retry_stop = now;
         }
 
         let is_limiting = match self.state.try_lock() {
@@ -233,17 +239,18 @@ impl eframe::App for SettingsWindow {
             }
         };
 
-        // 从配置中提取所有可修改字段
         let (
             mut threshold_db,
             mut selected_pid,
             mut attack_ms,
             mut release_ms,
-            mut scan_interval_ms,
-            mut volume_change_percentage_threshold,
+            mut _scan_interval_ms,
+            mut _volume_change_percentage_threshold,
             mut operation_mode,
             mut crossover_freq,
             mut limiter_mode,
+            mut crest_strong,
+            mut crest_mild,
         ) = match self.config.try_lock() {
             Ok(config) => (
                 config.threshold_db,
@@ -255,6 +262,8 @@ impl eframe::App for SettingsWindow {
                 config.operation_mode,
                 config.crossover_freq,
                 config.limiter_mode,
+                config.crest_strong,
+                config.crest_mild,
             ),
             Err(_) => {
                 ctx.request_repaint();
@@ -262,7 +271,7 @@ impl eframe::App for SettingsWindow {
             }
         };
 
-       CentralPanel::default().show(ctx, |ui| {
+        CentralPanel::default().show(ctx, |ui| {
             ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -284,7 +293,6 @@ impl eframe::App for SettingsWindow {
                     ui.separator();
 
                     ui.horizontal(|ui| {
-                       
                         ui.radio_value(&mut operation_mode, OperationMode::Cable, "虚拟声卡模式");
                     });
 
@@ -292,12 +300,22 @@ impl eframe::App for SettingsWindow {
 
                     if operation_mode == OperationMode::Cable {
                         ui.group(|ui| {
-                            // 标题栏：标题 + 刷新按钮
                             ui.horizontal(|ui| {
                                 ui.label("音频设备");
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("🔄 刷新设备").clicked() {
-                                        self.refresh_devices();
+                                    let can_refresh = self.last_refresh_click.elapsed() > std::time::Duration::from_secs(1);
+                                    if ui.add_enabled(can_refresh, egui::Button::new("🔄 刷新设备")).clicked() {
+                                        self.last_refresh_click = std::time::Instant::now();
+                                        let pending = Arc::clone(&self.pending_devices);
+                                        let ctx = ctx.clone();
+                                        std::thread::spawn(move || {
+                                            let devices = SettingsWindow::get_devices();
+                                            match pending.lock() {
+                                                Ok(mut guard) => *guard = Some(devices),
+                                                Err(e) => log::error!("刷新设备失败，锁异常: {}", e),
+                                            }
+                                            ctx.request_repaint();
+                                        });
                                     }
                                 });
                             });
@@ -362,24 +380,23 @@ impl eframe::App for SettingsWindow {
                                     });
                             });
                         });
-// 限幅模式选择（应该独立于 Cable 模式）
-ui.horizontal(|ui| {
-    ui.radio_value(&mut limiter_mode, LimiterMode::Fullband, "全频降");
-    ui.radio_value(&mut limiter_mode, LimiterMode::Multiband, "分块降");
-});
-if limiter_mode == LimiterMode::Multiband {
-    ui.label("分频点（低音保留频率）：");
-    ui.add(Slider::new(&mut crossover_freq, 0.0..=2000.0).text("Hz"));
-}
-                    } else {
-                        ui.label("选择要限制音量的应用：");
+
                         ui.horizontal(|ui| {
-                            if ui.button("刷新列表").clicked() {
-                                self.refresh_sessions();
-                            }
+                            ui.radio_value(&mut limiter_mode, LimiterMode::Fullband, "全频降");
+                            ui.radio_value(&mut limiter_mode, LimiterMode::Multiband, "分块降");
+                            // ui.radio_value(&mut limiter_mode, LimiterMode::Adaptive, "智能自适应");
                         });
 
-                       
+                        if limiter_mode == LimiterMode::Multiband {
+                            ui.label("分频点（低音保留频率）：");
+                            ui.add(Slider::new(&mut crossover_freq, 0.0..=2000.0).text("Hz"));
+                        } 
+                        // else if limiter_mode == LimiterMode::Adaptive {
+                        //     ui.label("强压缩阈值（枪声识别灵敏度）：");
+                        //     ui.add(Slider::new(&mut crest_strong, 0.0..=10.0).text("倍"));
+                        //     ui.label("轻微压缩阈值：");
+                        //     ui.add(Slider::new(&mut crest_mild, 0.0..=10.0).text("倍"));
+                        // }
                     }
 
                     ui.separator();
@@ -416,7 +433,6 @@ if limiter_mode == LimiterMode::Multiband {
                         ui.label(format!("{} ms", release_ms));
                     });
 
-
                     ui.separator();
 
                     ui.horizontal(|ui| {
@@ -429,7 +445,7 @@ if limiter_mode == LimiterMode::Multiband {
                             );
                             if start_btn.clicked() {
                                 if selected_pid.is_some() || operation_mode == OperationMode::Cable {
-                                    self.start_limiting();
+                                    self.start_limiting(ctx);
                                 } else {
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(
                                         "请先选择一个应用".to_string(),
@@ -448,7 +464,9 @@ if limiter_mode == LimiterMode::Multiband {
 
                         if ui.add_sized(btn_size, Button::new("保存设置")).clicked() {
                             match self.config.try_lock() {
-                                Ok(cfg) => self.save_config(&*cfg),
+                                Ok(cfg) => {
+                                    Self::save_config(cfg.clone());
+                                }
                                 Err(_) => log::error!("Cannot save config: lock poisoned"),
                             }
                         }
@@ -464,7 +482,7 @@ if limiter_mode == LimiterMode::Multiband {
                     });
                 });
         });
-        // 写回所有配置变化
+
         let mut need_stop = false;
         {
             let mut config = match self.config.try_lock() {
@@ -488,20 +506,22 @@ if limiter_mode == LimiterMode::Multiband {
             }
 
             update_field!(threshold_db, threshold_db, false);
-            update_field!(target_pid, selected_pid, true); // 应用变化需停止
+            update_field!(target_pid, selected_pid, true);
             update_field!(attack_ms, attack_ms, false);
             update_field!(release_ms, release_ms, false);
-            update_field!(scan_interval_ms, scan_interval_ms, false);
-            update_field!(volume_change_percentage_threshold, volume_change_percentage_threshold, false);
+            update_field!(scan_interval_ms, _scan_interval_ms, false);
+            update_field!(volume_change_percentage_threshold, _volume_change_percentage_threshold, false);
             update_field!(crossover_freq, crossover_freq, false);
-            update_field!(limiter_mode, limiter_mode, false); // 不需要停止，下一帧生效
+            update_field!(limiter_mode, limiter_mode, false);
+            update_field!(crest_strong, crest_strong, false);
+            update_field!(crest_mild, crest_mild, false);
+
             if operation_mode != config.operation_mode {
                 config.operation_mode = operation_mode;
                 changed = true;
                 need_stop = true;
             }
 
-            // 设备 ID 变更
             let new_input_id = self
                 .input_devices
                 .get(self.selected_input_idx)
@@ -522,13 +542,24 @@ if limiter_mode == LimiterMode::Multiband {
             }
 
             if changed {
-                self.save_config(&*config);
+                self.pending_save = true;
+            }
+            let now = std::time::Instant::now();
+            if self.pending_save && now.duration_since(self.last_save_time) > std::time::Duration::from_millis(500) {
+                let cfg_clone = config.clone();
+                Self::save_config(cfg_clone);
+                self.pending_save = false;
+                self.last_save_time = now;
             }
         }
 
         if need_stop && is_limiting {
             self.stop_limiting();
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.on_exit_save();
     }
 }
 

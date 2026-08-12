@@ -1,12 +1,10 @@
 pub mod limiter;
-pub mod volume;
 
 use cpal::StreamConfig;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 pub use limiter::LoudnessLimiter;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Producer, Split};
-pub use volume::VolumeController;
 
 use crate::config::{Config, LimiterMode};
 use crate::{AppState, config::OperationMode};
@@ -118,22 +116,18 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
 
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         if let Ok(mut l) = limiter_clone.try_lock() {
-            let mode = l.mode;
-            for &sample in data {
-                let final_sample = if mode == LimiterMode::Multiband {
-                    l.process_sample_multiband(sample)
-                } else {
-                    l.process_sample_fullband(sample)
-                };
-                if producer.try_push(final_sample).is_err() {
-                    // buffer full, sample dropped
-                }
-            }
-        } else {
-            for &sample in data {
-                if producer.try_push(sample).is_err() {}
-            }
+    let mode = l.mode;
+    for &sample in data {
+        let final_sample = match mode {
+            LimiterMode::Fullband => l.process_sample_fullband(sample),
+            LimiterMode::Multiband => l.process_sample_multiband(sample),
+            LimiterMode::Adaptive => l.process_sample_adaptive(sample),
+        };
+        if producer.try_push(final_sample).is_err() {
+            // buffer full, sample dropped
         }
+    }
+}
     };
 
     let output_data_fn = move |out_data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -206,9 +200,9 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
         if !should_continue {
             break;
         }
-        if let Ok(mut l) = limiter.lock() {
-            l.update_parameters();
-        }
+        if let Ok(mut l) = limiter.try_lock() {
+    l.update_parameters();
+}
         std::thread::sleep(Duration::from_secs(1));
     }
 

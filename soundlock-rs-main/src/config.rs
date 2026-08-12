@@ -18,6 +18,7 @@ pub enum LimiterMode {
     #[default]
     Fullband,   // 全频最大音量限制（原行为）
     Multiband,  // 分频保护脚步声（只压高频）
+    Adaptive,// 智能自适应：检测瞬态枪声并压制，保留脚步声
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -56,6 +57,11 @@ pub struct Config {
     // 新增：限幅模式
     #[serde(default)]
     pub limiter_mode: LimiterMode,
+    #[serde(default = "default_crest_strong")]
+pub crest_strong: f32,
+
+#[serde(default = "default_crest_mild")]
+pub crest_mild: f32,
 }
 
 fn default_threshold() -> f32 {
@@ -77,7 +83,8 @@ fn default_scan_interval_ms() -> u32 {
 fn default_volume_change_percentage_threshold() -> f32 {
     0.02
 }
-
+fn default_crest_strong() -> f32 { 8.0 }
+fn default_crest_mild() -> f32 { 4.0 }
 fn default_crossover_freq() -> f32 {
     300.0
 }
@@ -96,6 +103,8 @@ impl Default for Config {
             target_output_device_id: None,
             crossover_freq: default_crossover_freq(),
             limiter_mode: LimiterMode::default(),
+           crest_strong: default_crest_strong(),
+crest_mild: default_crest_mild(),
         }
     }
 }

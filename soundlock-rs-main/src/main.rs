@@ -38,7 +38,8 @@ fn message_box_yes_no(title: &str, text: &str) -> bool {
 }
 
 fn main() -> Result<(), ()> {
-    env_logger::init();
+    // 设置日志级别为 Debug，方便调试（发布时可调整为 Info）
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
     // ---------- 自动检测并安装 VB-Cable ----------
     if !setup::is_vbcable_installed() {
@@ -50,7 +51,6 @@ fn main() -> Result<(), ()> {
         if user_wants_install {
             match setup::install_vbcable() {
                 Ok(()) => {
-                    // 设置默认播放设备（音频服务已在安装时重启，无需再次重启）
                     if let Err(e) = setup::set_default_playback_device("CABLE Input") {
                         log::error!("设置默认播放设备失败: {}", e);
                     }
@@ -63,14 +63,15 @@ fn main() -> Result<(), ()> {
     }
     // ---------------------------------------------
 
-    let instance = single_instance::SingleInstance::new("SoundLockRustInstance").unwrap();
+    let instance = single_instance::SingleInstance::new("SoundLockRustInstance")
+        .expect("无法创建单实例锁");
 
     if !instance.is_single() {
         return Ok(());
     }
 
     let icon_data = image::load_from_memory(include_bytes!("../assets/icon.png"))
-        .unwrap()
+        .expect("图标加载失败")
         .to_rgba8()
         .to_vec();
 
@@ -87,7 +88,12 @@ fn main() -> Result<(), ()> {
     };
 
     let app_state = Arc::new(Mutex::new(AppState::default()));
-    let config = Config::load().unwrap();
+
+    // 配置加载：若失败则使用默认配置并记录错误，绝不 panic
+    let config = Config::load().unwrap_or_else(|e| {
+        log::error!("加载配置失败: {}, 将使用默认配置", e);
+        Arc::new(Mutex::new(Config::default()))
+    });
 
     eframe::run_native(
         "Sound Lock Rust",
@@ -99,7 +105,7 @@ fn main() -> Result<(), ()> {
             )))
         }),
     )
-    .unwrap();
+    .expect("无法创建窗口");
 
     Ok(())
 }
