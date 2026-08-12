@@ -1,9 +1,12 @@
-use crate::config::{Config, LimiterMode, OperationMode};
+use crate::config::Config;
+use crate::tray_state;
 use crate::{AppState, audio};
 use cpal::Device;
 use cpal::traits::{DeviceTrait, HostTrait};
 use egui::*;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub struct SettingsWindow {
     state: Arc<Mutex<AppState>>,
@@ -15,14 +18,15 @@ pub struct SettingsWindow {
     retry_start: bool,
     retry_stop: bool,
     fonts_loaded: bool,
-    last_retry_start: std::time::Instant,
-    last_retry_stop: std::time::Instant,
-    last_refresh_click: std::time::Instant,
-
+    last_retry_start: Instant,
+    last_retry_stop: Instant,
+    last_refresh_click: Instant,
     pending_devices: Arc<Mutex<Option<(Vec<(Device, String)>, Vec<(Device, String)>)>>>,
-
-    last_save_time: std::time::Instant,
+    last_save_time: Instant,
     pending_save: bool,
+    // 托盘相关
+    is_window_visible: bool,
+    last_tray_check: Instant,
 }
 
 impl SettingsWindow {
@@ -46,12 +50,14 @@ impl SettingsWindow {
             retry_start: false,
             retry_stop: false,
             fonts_loaded: false,
-            last_retry_start: std::time::Instant::now(),
-            last_retry_stop: std::time::Instant::now(),
-            last_refresh_click: std::time::Instant::now(),
+            last_retry_start: Instant::now(),
+            last_retry_stop: Instant::now(),
+            last_refresh_click: Instant::now(),
             pending_devices,
-            last_save_time: std::time::Instant::now(),
+            last_save_time: Instant::now(),
             pending_save: false,
+            is_window_visible: true,
+            last_tray_check: Instant::now(),
         }
     }
 
@@ -75,7 +81,6 @@ impl SettingsWindow {
             .unwrap_or_default();
         (input_devices, output_devices)
     }
-
 
     fn update_selected_indices(&mut self) {
         if let Ok(cfg) = self.config.try_lock() {
@@ -101,11 +106,9 @@ impl SettingsWindow {
     }
 
     fn start_limiting(&mut self, ctx: &Context) {
-        let (mode, _pid, input_id, output_id) = {
+        let (input_id, output_id) = {
             match self.config.try_lock() {
                 Ok(cfg) => (
-                    cfg.operation_mode,
-                    cfg.target_pid,
                     cfg.target_input_device_id.clone(),
                     cfg.target_output_device_id.clone(),
                 ),
@@ -116,12 +119,10 @@ impl SettingsWindow {
                 }
             }
         };
-
-        if mode == OperationMode::Cable && (input_id.is_none() || output_id.is_none()) {
+        if input_id.is_none() || output_id.is_none() {
             log::warn!("Cannot start limiting: no audio devices selected");
             return;
         }
-
         match self.state.try_lock() {
             Ok(mut state) => {
                 state.is_limiting = true;
@@ -136,11 +137,9 @@ impl SettingsWindow {
                 return;
             }
         }
-
         let state = Arc::clone(&self.state);
         let config = Arc::clone(&self.config);
         let ctx = ctx.clone();
-
         std::thread::spawn(move || {
             audio::start_limiter(state, config);
             ctx.request_repaint();
@@ -175,6 +174,35 @@ impl SettingsWindow {
 
 impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // 托盘退出请求
+        if tray_state::SHOULD_EXIT.load(Ordering::SeqCst) {
+            self.on_exit_save();
+            std::process::exit(0);
+        }
+
+       // 托盘恢复窗口请求
+if tray_state::WINDOW_VISIBLE.swap(false, Ordering::SeqCst) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+
+    self.is_window_visible = true;
+    ctx.request_repaint();
+}
+
+        // 拦截关闭按钮，隐藏窗口
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.is_window_visible = false;
+        }
+
+        // 窗口隐藏时保持 UI 线程活跃（每秒唤醒一次）
+        if !self.is_window_visible && self.last_tray_check.elapsed() > std::time::Duration::from_secs(1) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            self.last_tray_check = Instant::now();
+        }
+
         let devices_updated = {
             if let Ok(mut pending) = self.pending_devices.try_lock() {
                 if let Some((input, output)) = pending.take() {
@@ -221,7 +249,7 @@ impl eframe::App for SettingsWindow {
             self.fonts_loaded = true;
         }
 
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         if self.retry_start && now.duration_since(self.last_retry_start) > std::time::Duration::from_secs(1) {
             self.start_limiting(ctx);
             self.last_retry_start = now;
@@ -239,35 +267,13 @@ impl eframe::App for SettingsWindow {
             }
         };
 
-        let (
-            mut threshold_db,
-            mut selected_pid,
-            mut attack_ms,
-            mut release_ms,
-            mut _scan_interval_ms,
-            mut _volume_change_percentage_threshold,
-            mut operation_mode,
-            mut crossover_freq,
-            mut limiter_mode,
-            mut crest_strong,
-            mut crest_mild,
-        ) = match self.config.try_lock() {
-            Ok(config) => (
-                config.threshold_db,
-                config.target_pid,
-                config.attack_ms,
-                config.release_ms,
-                config.scan_interval_ms,
-                config.volume_change_percentage_threshold,
-                config.operation_mode,
-                config.crossover_freq,
-                config.limiter_mode,
-                config.crest_strong,
-                config.crest_mild,
-            ),
-            Err(_) => {
-                ctx.request_repaint();
-                return;
+        let (mut threshold_db, mut attack_ms, mut release_ms) = {
+            match self.config.try_lock() {
+                Ok(config) => (config.threshold_db, config.attack_ms, config.release_ms),
+                Err(_) => {
+                    ctx.request_repaint();
+                    return;
+                }
             }
         };
 
@@ -276,10 +282,8 @@ impl eframe::App for SettingsWindow {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(10.0, 10.0);
-
-                    ui.heading("Sound Lock 设置");
+                    ui.heading("Sound Lock 全频降音");
                     ui.separator();
-
                     ui.horizontal(|ui| {
                         ui.label("状态：");
                         let (color, text) = if is_limiting {
@@ -289,201 +293,116 @@ impl eframe::App for SettingsWindow {
                         };
                         ui.colored_label(color, text);
                     });
-
                     ui.separator();
 
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut operation_mode, OperationMode::Cable, "虚拟声卡模式");
-                    });
-
-                    ui.separator();
-
-                    if operation_mode == OperationMode::Cable {
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("音频设备");
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let can_refresh = self.last_refresh_click.elapsed() > std::time::Duration::from_secs(1);
-                                    if ui.add_enabled(can_refresh, egui::Button::new("🔄 刷新设备")).clicked() {
-                                        self.last_refresh_click = std::time::Instant::now();
-                                        let pending = Arc::clone(&self.pending_devices);
-                                        let ctx = ctx.clone();
-                                        std::thread::spawn(move || {
-                                            let devices = SettingsWindow::get_devices();
-                                            match pending.lock() {
-                                                Ok(mut guard) => *guard = Some(devices),
-                                                Err(e) => log::error!("刷新设备失败，锁异常: {}", e),
-                                            }
-                                            ctx.request_repaint();
-                                        });
+                    // 设备选择
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("音频设备");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let can_refresh = self.last_refresh_click.elapsed() > std::time::Duration::from_secs(1);
+                                if ui.add_enabled(can_refresh, egui::Button::new("🔄 刷新设备")).clicked() {
+                                    self.last_refresh_click = Instant::now();
+                                    let pending = Arc::clone(&self.pending_devices);
+                                    let ctx = ctx.clone();
+                                    std::thread::spawn(move || {
+                                        let devices = SettingsWindow::get_devices();
+                                        match pending.lock() {
+                                            Ok(mut guard) => *guard = Some(devices),
+                                            Err(e) => log::error!("刷新设备失败，锁异常: {}", e),
+                                        }
+                                        ctx.request_repaint();
+                                    });
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("输入：");
+                            let selected_text = if self.selected_input_idx == usize::MAX {
+                                "未选择".to_owned()
+                            } else {
+                                self.input_devices
+                                    .get(self.selected_input_idx)
+                                    .and_then(|(d, _)| d.description().ok())
+                                    .map(|d| d.name().to_string())
+                                    .unwrap_or_else(|| "未知设备".to_string())
+                            };
+                            egui::ComboBox::from_id_salt("input_device_combo")
+                                .selected_text(&selected_text)
+                                .show_ui(ui, |ui| {
+                                    for (idx, (d, _)) in self.input_devices.iter().enumerate() {
+                                        let name = d.description().ok().map(|desc| desc.name().to_string()).unwrap_or_else(|| format!("设备 {}", idx));
+                                        ui.selectable_value(&mut self.selected_input_idx, idx, name);
                                     }
                                 });
-                            });
-
-                            ui.horizontal(|ui| {
-                                ui.label("输入：");
-                                let selected_text = if self.selected_input_idx == usize::MAX {
-                                    "未选择".to_owned()
-                                } else {
-                                    self.input_devices
-                                        .get(self.selected_input_idx)
-                                        .and_then(|(d, _)| d.description().ok())
-                                        .map(|d| d.name().to_string())
-                                        .unwrap_or_else(|| "未知设备".to_string())
-                                };
-
-                                egui::ComboBox::from_id_salt("input_device_combo")
-                                    .selected_text(&selected_text)
-                                    .show_ui(ui, |ui| {
-                                        for (idx, (d, _)) in self.input_devices.iter().enumerate() {
-                                            let name = d
-                                                .description()
-                                                .ok()
-                                                .map(|desc| desc.name().to_string())
-                                                .unwrap_or_else(|| format!("设备 {}", idx));
-                                            ui.selectable_value(
-                                                &mut self.selected_input_idx,
-                                                idx,
-                                                name,
-                                            );
-                                        }
-                                    });
-                            });
-
-                            ui.horizontal(|ui| {
-                                ui.label("输出：");
-                                let selected_text = if self.selected_output_idx == usize::MAX {
-                                    "未选择".to_owned()
-                                } else {
-                                    self.output_devices
-                                        .get(self.selected_output_idx)
-                                        .and_then(|(d, _)| d.description().ok())
-                                        .map(|d| d.name().to_string())
-                                        .unwrap_or_else(|| "未知设备".to_string())
-                                };
-
-                                egui::ComboBox::from_id_salt("output_device_combo")
-                                    .selected_text(&selected_text)
-                                    .show_ui(ui, |ui| {
-                                        for (idx, (d, _)) in self.output_devices.iter().enumerate() {
-                                            let name = d
-                                                .description()
-                                                .ok()
-                                                .map(|desc| desc.name().to_string())
-                                                .unwrap_or_else(|| format!("设备 {}", idx));
-                                            ui.selectable_value(
-                                                &mut self.selected_output_idx,
-                                                idx,
-                                                name,
-                                            );
-                                        }
-                                    });
-                            });
                         });
-
                         ui.horizontal(|ui| {
-                            ui.radio_value(&mut limiter_mode, LimiterMode::Fullband, "全频降");
-                            ui.radio_value(&mut limiter_mode, LimiterMode::Multiband, "分块降");
-                            // ui.radio_value(&mut limiter_mode, LimiterMode::Adaptive, "智能自适应");
+                            ui.label("输出：");
+                            let selected_text = if self.selected_output_idx == usize::MAX {
+                                "未选择".to_owned()
+                            } else {
+                                self.output_devices
+                                    .get(self.selected_output_idx)
+                                    .and_then(|(d, _)| d.description().ok())
+                                    .map(|d| d.name().to_string())
+                                    .unwrap_or_else(|| "未知设备".to_string())
+                            };
+                            egui::ComboBox::from_id_salt("output_device_combo")
+                                .selected_text(&selected_text)
+                                .show_ui(ui, |ui| {
+                                    for (idx, (d, _)) in self.output_devices.iter().enumerate() {
+                                        let name = d.description().ok().map(|desc| desc.name().to_string()).unwrap_or_else(|| format!("设备 {}", idx));
+                                        ui.selectable_value(&mut self.selected_output_idx, idx, name);
+                                    }
+                                });
                         });
-
-                        if limiter_mode == LimiterMode::Multiband {
-                            ui.label("分频点（低音保留频率）：");
-                            ui.add(Slider::new(&mut crossover_freq, 0.0..=2000.0).text("Hz"));
-                        } 
-                        // else if limiter_mode == LimiterMode::Adaptive {
-                        //     ui.label("强压缩阈值（枪声识别灵敏度）：");
-                        //     ui.add(Slider::new(&mut crest_strong, 0.0..=10.0).text("倍"));
-                        //     ui.label("轻微压缩阈值：");
-                        //     ui.add(Slider::new(&mut crest_mild, 0.0..=10.0).text("倍"));
-                        // }
-                    }
+                    });
 
                     ui.separator();
-
                     ui.label("最大音量阈值：");
                     ui.horizontal(|ui| {
-                        ui.add(
-                            Slider::new(&mut threshold_db, -60.0..=0.0)
-                                .text("dB")
-                                .max_decimals(1),
-                        );
+                        ui.add(Slider::new(&mut threshold_db, -60.0..=0.0).text("dB").max_decimals(1));
                         ui.label(format!("{:.1} dB", threshold_db));
                     });
-
-                    ui.separator();
-
                     ui.label("触发时间：");
                     ui.horizontal(|ui| {
-                        ui.add(
-                            Slider::new(&mut attack_ms, 1..=300)
-                                .text("毫秒")
-                                .max_decimals(0),
-                        );
+                        ui.add(Slider::new(&mut attack_ms, 1..=300).text("毫秒").max_decimals(0));
                         ui.label(format!("{} ms", attack_ms));
                     });
-
                     ui.label("释放时间：");
                     ui.horizontal(|ui| {
-                        ui.add(
-                            Slider::new(&mut release_ms, 1..=300)
-                                .text("毫秒")
-                                .max_decimals(0),
-                        );
+                        ui.add(Slider::new(&mut release_ms, 1..=300).text("毫秒").max_decimals(0));
                         ui.label(format!("{} ms", release_ms));
                     });
-
                     ui.separator();
 
                     ui.horizontal(|ui| {
                         let btn_size = Vec2::new(140.0, 40.0);
-
                         if !is_limiting {
-                            let start_btn = ui.add_sized(
-                                btn_size,
-                                Button::new("启动限制").fill(Color32::from_rgb(0, 150, 0)),
-                            );
-                            if start_btn.clicked() {
-                                if selected_pid.is_some() || operation_mode == OperationMode::Cable {
-                                    self.start_limiting(ctx);
-                                } else {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                                        "请先选择一个应用".to_string(),
-                                    ));
-                                }
+                            if ui.add_sized(btn_size, Button::new("启动限制").fill(Color32::from_rgb(0, 150, 0))).clicked() {
+                                self.start_limiting(ctx);
                             }
                         } else {
-                            let stop_btn = ui.add_sized(
-                                btn_size,
-                                Button::new("停止").fill(Color32::from_rgb(200, 0, 0)),
-                            );
-                            if stop_btn.clicked() {
+                            if ui.add_sized(btn_size, Button::new("停止").fill(Color32::from_rgb(200, 0, 0))).clicked() {
                                 self.stop_limiting();
                             }
                         }
-
                         if ui.add_sized(btn_size, Button::new("保存设置")).clicked() {
                             match self.config.try_lock() {
-                                Ok(cfg) => {
-                                    Self::save_config(cfg.clone());
-                                }
+                                Ok(cfg) => Self::save_config(cfg.clone()),
                                 Err(_) => log::error!("Cannot save config: lock poisoned"),
                             }
                         }
                     });
-
                     ui.separator();
                     ui.add_space(15.0);
-
                     ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.hyperlink_to("GitHub", "https://github.com/winsrewu/soundlock-rs");
-                        });
+                        ui.hyperlink_to("GitHub", "https://github.com/winsrewu/soundlock-rs");
                     });
                 });
         });
 
-        let mut need_stop = false;
+        // 写回配置
         {
             let mut config = match self.config.try_lock() {
                 Ok(c) => c,
@@ -492,69 +411,38 @@ impl eframe::App for SettingsWindow {
                     return;
                 }
             };
-
             let mut changed = false;
-
-            macro_rules! update_field {
-                ($field:ident, $val:expr, $stop:expr) => {
-                    if $val != config.$field {
-                        config.$field = $val;
-                        changed = true;
-                        need_stop |= $stop;
-                    }
-                };
-            }
-
-            update_field!(threshold_db, threshold_db, false);
-            update_field!(target_pid, selected_pid, true);
-            update_field!(attack_ms, attack_ms, false);
-            update_field!(release_ms, release_ms, false);
-            update_field!(scan_interval_ms, _scan_interval_ms, false);
-            update_field!(volume_change_percentage_threshold, _volume_change_percentage_threshold, false);
-            update_field!(crossover_freq, crossover_freq, false);
-            update_field!(limiter_mode, limiter_mode, false);
-            update_field!(crest_strong, crest_strong, false);
-            update_field!(crest_mild, crest_mild, false);
-
-            if operation_mode != config.operation_mode {
-                config.operation_mode = operation_mode;
+            if threshold_db != config.threshold_db {
+                config.threshold_db = threshold_db;
                 changed = true;
-                need_stop = true;
             }
-
-            let new_input_id = self
-                .input_devices
-                .get(self.selected_input_idx)
-                .map(|(_, id)| id.clone());
+            if attack_ms != config.attack_ms {
+                config.attack_ms = attack_ms;
+                changed = true;
+            }
+            if release_ms != config.release_ms {
+                config.release_ms = release_ms;
+                changed = true;
+            }
+            let new_input_id = self.input_devices.get(self.selected_input_idx).map(|(_, id)| id.clone());
             if new_input_id != config.target_input_device_id {
                 config.target_input_device_id = new_input_id;
                 changed = true;
-                need_stop = true;
             }
-            let new_output_id = self
-                .output_devices
-                .get(self.selected_output_idx)
-                .map(|(_, id)| id.clone());
+            let new_output_id = self.output_devices.get(self.selected_output_idx).map(|(_, id)| id.clone());
             if new_output_id != config.target_output_device_id {
                 config.target_output_device_id = new_output_id;
                 changed = true;
-                need_stop = true;
             }
-
             if changed {
                 self.pending_save = true;
             }
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             if self.pending_save && now.duration_since(self.last_save_time) > std::time::Duration::from_millis(500) {
-                let cfg_clone = config.clone();
-                Self::save_config(cfg_clone);
+                Self::save_config(config.clone());
                 self.pending_save = false;
                 self.last_save_time = now;
             }
-        }
-
-        if need_stop && is_limiting {
-            self.stop_limiting();
         }
     }
 

@@ -6,8 +6,8 @@ pub use limiter::LoudnessLimiter;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Producer, Split};
 
-use crate::config::{Config, LimiterMode};
-use crate::{AppState, config::OperationMode};
+use crate::config::Config;
+use crate::AppState;
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -15,16 +15,7 @@ use std::{
 
 pub fn start_limiter(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>>) {
     std::thread::spawn(move || {
-        let mode = match config.try_lock() {
-            Ok(cfg) => cfg.operation_mode,
-            Err(_) => {
-                log::error!("Config lock poisoned, stopping limiter thread");
-                return;
-            }
-        };
-        if mode == OperationMode::Cable {
-            run_limiter_loop_cable(state, config);
-        } 
+        run_limiter_loop_cable(state, config);
     });
 }
 
@@ -116,18 +107,17 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
 
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         if let Ok(mut l) = limiter_clone.try_lock() {
-    let mode = l.mode;
-    for &sample in data {
-        let final_sample = match mode {
-            LimiterMode::Fullband => l.process_sample_fullband(sample),
-            LimiterMode::Multiband => l.process_sample_multiband(sample),
-            LimiterMode::Adaptive => l.process_sample_adaptive(sample),
-        };
-        if producer.try_push(final_sample).is_err() {
-            // buffer full, sample dropped
+            for &sample in data {
+                let processed = l.process_sample(sample);
+                if producer.try_push(processed).is_err() {
+                    // buffer full, sample dropped
+                }
+            }
+        } else {
+            for &sample in data {
+                if producer.try_push(sample).is_err() {}
+            }
         }
-    }
-}
     };
 
     let output_data_fn = move |out_data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -200,13 +190,13 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
         if !should_continue {
             break;
         }
+        // 更新参数（阈值、attack、release 从 config 同步）
         if let Ok(mut l) = limiter.try_lock() {
-    l.update_parameters();
-}
+            l.update_parameters();
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
 
     drop(input_stream);
     drop(output_stream);
 }
-
