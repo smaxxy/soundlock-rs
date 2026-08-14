@@ -1,10 +1,8 @@
 use crate::config::Config;
-use crate::tray_state;
 use crate::{AppState, audio};
 use cpal::Device;
 use cpal::traits::{DeviceTrait, HostTrait};
 use egui::*;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -24,9 +22,6 @@ pub struct SettingsWindow {
     pending_devices: Arc<Mutex<Option<(Vec<(Device, String)>, Vec<(Device, String)>)>>>,
     last_save_time: Instant,
     pending_save: bool,
-    // 托盘相关
-    is_window_visible: bool,
-    last_tray_check: Instant,
 }
 
 impl SettingsWindow {
@@ -56,8 +51,6 @@ impl SettingsWindow {
             pending_devices,
             last_save_time: Instant::now(),
             pending_save: false,
-            is_window_visible: true,
-            last_tray_check: Instant::now(),
         }
     }
 
@@ -175,34 +168,6 @@ impl SettingsWindow {
 impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         crate::diagnostics::ui_tick();
-        // 托盘退出请求
-        if tray_state::SHOULD_EXIT.load(Ordering::SeqCst) {
-            self.on_exit_save();
-            std::process::exit(0);
-        }
-
-       // 托盘恢复窗口请求
-if tray_state::WINDOW_VISIBLE.swap(false, Ordering::SeqCst) {
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-
-    self.is_window_visible = true;
-    ctx.request_repaint();
-}
-
-        // 拦截关闭按钮，隐藏窗口
-        if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.is_window_visible = false;
-        }
-
-        // 窗口隐藏时保持 UI 线程活跃（每秒唤醒一次）
-        if !self.is_window_visible && self.last_tray_check.elapsed() > std::time::Duration::from_secs(1) {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
-            self.last_tray_check = Instant::now();
-        }
 
         let devices_updated = {
             if let Ok(mut pending) = self.pending_devices.try_lock() {
@@ -296,7 +261,6 @@ if tray_state::WINDOW_VISIBLE.swap(false, Ordering::SeqCst) {
                     });
                     ui.separator();
 
-                    // 设备选择
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.label("音频设备");

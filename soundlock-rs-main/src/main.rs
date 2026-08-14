@@ -39,7 +39,6 @@ fn message_box_yes_no(title: &str, text: &str) -> bool {
 }
 
 const WM_TRAYICON: u32 = WM_APP;
-const IDM_SHOW: usize = 1001;
 const IDM_EXIT: usize = 1002;
 
 unsafe extern "system" fn tray_wnd_proc(
@@ -51,14 +50,11 @@ unsafe extern "system" fn tray_wnd_proc(
     use std::sync::atomic::Ordering;
 
     if msg == WM_TRAYICON {
-        if lparam.0 as u32 == WM_LBUTTONUP {
-            tray_state::WINDOW_VISIBLE.store(true, Ordering::SeqCst);
-        } else if lparam.0 as u32 == WM_RBUTTONUP {
+        if lparam.0 as u32 == WM_RBUTTONUP {
             let mut cursor_pos = Default::default();
             GetCursorPos(&mut cursor_pos);
             SetForegroundWindow(hwnd);
             let menu = CreatePopupMenu().unwrap();
-            AppendMenuW(menu, MF_STRING, IDM_SHOW, w!("显示窗口")).ok();
             AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("退出")).ok();
             TrackPopupMenu(
                 menu,
@@ -72,41 +68,87 @@ unsafe extern "system" fn tray_wnd_proc(
             DestroyMenu(menu).ok();
         }
     } else if msg == WM_COMMAND {
-    let cmd = wparam.0 as usize;
-
-    if cmd == IDM_SHOW {
-        // 通过 Windows 原生 API 直接恢复 Sound Lock 主窗口
-        let main_hwnd = FindWindowW(None, w!("Sound Lock Rust"));
-
-        if let Ok(hwnd) = main_hwnd {
-            if !hwnd.is_invalid() {
-                ShowWindow(hwnd, SW_RESTORE);
-                ShowWindow(hwnd, SW_SHOW);
-                SetForegroundWindow(hwnd);
-            } else {
-                log::warn!("找到 Sound Lock 窗口，但 HWND 无效");
-            }
-        } else {
-            log::warn!("没有找到 Sound Lock Rust 主窗口");
+        let cmd = wparam.0 as usize;
+        if cmd == IDM_EXIT {
+            tray_state::SHOULD_EXIT.store(true, Ordering::SeqCst);
+            PostQuitMessage(0);
         }
-
-        // 同时通知 UI 状态恢复
-        tray_state::WINDOW_VISIBLE.store(true, Ordering::SeqCst);
-    } else if cmd == IDM_EXIT {
-        tray_state::SHOULD_EXIT.store(true, Ordering::SeqCst);
-        PostQuitMessage(0);
-    }
-} else if msg == WM_DESTROY {
+    } else if msg == WM_DESTROY {
         PostQuitMessage(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+fn run_tray_loop() {
+    unsafe {
+        let hinstance = GetModuleHandleW(None).unwrap();
+        let class_name = w!("SoundLockTrayWindow");
+
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(tray_wnd_proc),
+            hInstance: hinstance.into(),
+            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap(),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
+            hbrBackground: HBRUSH::default(),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: class_name,
+            hIconSm: LoadIconW(None, IDI_APPLICATION).unwrap(),
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+
+        let hwnd = CreateWindowExW(
+            WS_EX_NOACTIVATE,
+            class_name,
+            w!(""),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            0,
+            0,
+            None,
+            None,
+            Some(hinstance.into()),
+            None,
+        ).expect("CreateWindowExW failed");
+
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: 1,
+            uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+            uCallbackMessage: WM_TRAYICON,
+            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap(),
+            szTip: {
+                let mut tip: [u16; 128] = [0; 128];
+                let text = "Sound Lock\0";
+                for (i, c) in text.encode_utf16().take(127).enumerate() {
+                    tip[i] = c;
+                }
+                tip
+            },
+            ..Default::default()
+        };
+        Shell_NotifyIconW(NIM_ADD, &mut nid).ok();
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            DispatchMessageW(&msg);
+            if tray_state::SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+        }
+        Shell_NotifyIconW(NIM_DELETE, &mut nid).ok();
+    }
+}
+
 fn main() -> Result<(), ()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
-   // 启动 Sound Lock 诊断监控
     diagnostics::init();
-    // VB-Cable 安装（保持不变）
+
+    // VB-Cable 安装
     if !setup::is_vbcable_installed() {
         let user_wants_install = message_box_yes_no(
             "虚拟声卡未安装",
@@ -131,72 +173,6 @@ fn main() -> Result<(), ()> {
     if !instance.is_single() {
         return Ok(());
     }
-
-    // ---------- 启动托盘线程 ----------
-    std::thread::spawn(move || {
-        unsafe {
-            let hinstance = GetModuleHandleW(None).unwrap();
-            let class_name = w!("SoundLockTrayWindow");
-            let wc = WNDCLASSEXW {
-                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                style: CS_HREDRAW | CS_VREDRAW,
-                lpfnWndProc: Some(tray_wnd_proc),
-                hInstance: hinstance.into(),
-                hIcon: LoadIconW(None, IDI_APPLICATION).unwrap(),
-                hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
-                hbrBackground: HBRUSH::default(),
-                lpszMenuName: PCWSTR::null(),
-                lpszClassName: class_name,
-                hIconSm: LoadIconW(None, IDI_APPLICATION).unwrap(),
-                ..Default::default()
-            };
-            RegisterClassExW(&wc);
-
-            let hwnd = CreateWindowExW(
-                WS_EX_NOACTIVATE,
-                class_name,
-                w!(""),
-                WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                0,
-                0,
-                None,
-                None,
-                Some(hinstance.into()),
-                None,
-            ).expect("CreateWindowExW failed");
-
-            let mut nid = NOTIFYICONDATAW {
-                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                hWnd: hwnd,
-                uID: 1,
-                uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
-                uCallbackMessage: WM_TRAYICON,
-                hIcon: LoadIconW(None, IDI_APPLICATION).unwrap(),
-                szTip: {
-                    let mut tip: [u16; 128] = [0; 128];
-                    let text = "Sound Lock\0";
-                    for (i, c) in text.encode_utf16().take(127).enumerate() {
-                        tip[i] = c;
-                    }
-                    tip
-                },
-                ..Default::default()
-            };
-            Shell_NotifyIconW(NIM_ADD, &mut nid).ok();
-
-            let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                DispatchMessageW(&msg);
-                if tray_state::SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-            }
-            Shell_NotifyIconW(NIM_DELETE, &mut nid).ok();
-        }
-    });
-    // ---------------------------------
 
     let icon_data = image::load_from_memory(include_bytes!("../assets/icon.png"))
         .expect("图标加载失败")
@@ -233,5 +209,12 @@ fn main() -> Result<(), ()> {
     )
     .expect("无法创建窗口");
 
+    // UI 已关闭，现在创建托盘图标并进入消息循环
+    log::info!("UI 已关闭，启动系统托盘，限幅继续运行");
+    run_tray_loop();
+
+    // 当托盘退出后，给音频线程一点时间结束（音频循环会检测 SHOULD_EXIT）
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    log::info!("程序退出");
     Ok(())
 }

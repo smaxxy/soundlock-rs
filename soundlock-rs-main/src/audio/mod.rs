@@ -195,26 +195,31 @@ let output_err_fn = |err| {
         return;
     }
 
-    loop {
-        let should_continue = loop {
-            match state.try_lock() {
-                Ok(s) => break s.is_limiting,
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(_) => break false,
+loop {
+    let should_continue = loop {
+        match state.try_lock() {
+            Ok(s) => break s.is_limiting,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
             }
-        };
-        if !should_continue {
-            break;
+            Err(_) => break false,
         }
-        // 更新参数（阈值、attack、release 从 config 同步）
-        if let Ok(mut l) = limiter.try_lock() {
-            l.update_parameters();
-        }
-        std::thread::sleep(Duration::from_secs(1));
+    };
+
+    // 检查退出标志
+    let should_exit = crate::tray_state::SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst);
+
+    if !should_continue || should_exit {
+        break;
     }
+
+    // 更新参数...
+    if let Ok(mut l) = limiter.try_lock() {
+        l.update_parameters();
+    }
+    std::thread::sleep(Duration::from_secs(1));
+}
 
     drop(input_stream);
     drop(output_stream);
