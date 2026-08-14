@@ -2,6 +2,7 @@
 
 mod audio;
 mod config;
+mod diagnostics;
 mod setup;
 mod tray_state;
 mod ui;
@@ -103,7 +104,8 @@ unsafe extern "system" fn tray_wnd_proc(
 
 fn main() -> Result<(), ()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
-
+   // 启动 Sound Lock 诊断监控
+    diagnostics::init();
     // VB-Cable 安装（保持不变）
     if !setup::is_vbcable_installed() {
         let user_wants_install = message_box_yes_no(

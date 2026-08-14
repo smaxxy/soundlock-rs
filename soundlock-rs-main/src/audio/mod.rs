@@ -106,48 +106,67 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
     let limiter_clone = Arc::clone(&limiter);
 
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        if let Ok(mut l) = limiter_clone.try_lock() {
-            for &sample in data {
-                let processed = l.process_sample(sample);
-                if producer.try_push(processed).is_err() {
-                    // buffer full, sample dropped
-                }
-            }
-        } else {
-            for &sample in data {
-                if producer.try_push(sample).is_err() {}
+    crate::diagnostics::input_callback();
+
+    if let Ok(mut l) = limiter_clone.try_lock() {
+        for &sample in data {
+            let processed = l.process_sample(sample);
+
+            if producer.try_push(processed).is_err() {
+                crate::diagnostics::ring_push_drop();
             }
         }
-    };
+    } else {
+        crate::diagnostics::limiter_lock_miss();
+
+        for &sample in data {
+            if producer.try_push(sample).is_err() {
+                crate::diagnostics::ring_push_drop();
+            }
+        }
+    }
+};
 
     let output_data_fn = move |out_data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        let mut fell_behind = false;
-        let mut last_sample = 0.0f32;
-        for sample in out_data.iter_mut() {
-            *sample = match consumer.try_pop() {
-                Some(s) => {
-                    last_sample = s;
-                    s
-                }
-                None => {
-                    fell_behind = true;
-                    last_sample
-                }
-            };
-        }
-        if fell_behind {
-            log::warn!("Input buffer empty");
-        }
-    };
+    crate::diagnostics::output_callback();
 
-    let err_fn = |err| log::error!("Stream error: {}", err);
+    let mut fell_behind = false;
+    let mut last_sample = 0.0f32;
 
+    for sample in out_data.iter_mut() {
+        *sample = match consumer.try_pop() {
+            Some(s) => {
+                last_sample = s;
+                s
+            }
+            None => {
+                fell_behind = true;
+                last_sample
+            }
+        };
+    }
+
+    if fell_behind {
+        crate::diagnostics::output_underrun();
+        log::warn!("Input buffer empty");
+    }
+};
+
+    let input_err_fn = |err| {
+    crate::diagnostics::input_error();
+    log::error!("Input stream error: {}", err);
+};
+
+let output_err_fn = |err| {
+    crate::diagnostics::output_error();
+    log::error!("Output stream error: {}", err);
+};
     let input_stream = match input_device.build_input_stream(
-        &stream_config,
-        input_data_fn,
-        err_fn,
-        None,
-    ) {
+    &stream_config,
+    input_data_fn,
+    input_err_fn,
+    None,
+) {
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to build input stream: {}", e);
@@ -155,11 +174,11 @@ fn run_limiter_loop_cable(state: Arc<Mutex<AppState>>, config: Arc<Mutex<Config>
         }
     };
     let output_stream = match output_device.build_output_stream(
-        &stream_config,
-        output_data_fn,
-        err_fn,
-        None,
-    ) {
+    &stream_config,
+    output_data_fn,
+    output_err_fn,
+    None,
+) {
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to build output stream: {}", e);

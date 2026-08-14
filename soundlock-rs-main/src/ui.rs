@@ -174,6 +174,7 @@ impl SettingsWindow {
 
 impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        crate::diagnostics::ui_tick();
         // 托盘退出请求
         if tray_state::SHOULD_EXIT.load(Ordering::SeqCst) {
             self.on_exit_save();
