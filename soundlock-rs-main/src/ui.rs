@@ -294,9 +294,76 @@ ui.horizontal(|ui| {
             Ordering::SeqCst,
         );
     }
-
-    ui.label("需无边框（右键隐藏）");
 });
+
+if crosshair_enabled {
+    // =========================
+    // 准星颜色
+    // =========================
+
+    let current_color =
+        crate::tray_state::CROSSHAIR_COLOR
+            .load(Ordering::SeqCst);
+
+    let r =
+        ((current_color >> 16) & 0xFF) as u8;
+
+    let g =
+        ((current_color >> 8) & 0xFF) as u8;
+
+    let b =
+        (current_color & 0xFF) as u8;
+
+    let mut color =
+        egui::Color32::from_rgb(r, g, b);
+
+    ui.horizontal(|ui| {
+        ui.label("准星颜色：");
+
+        if ui
+            .color_edit_button_srgba(&mut color)
+            .changed()
+        {
+            let rgb =
+                ((color.r() as u32) << 16)
+                | ((color.g() as u32) << 8)
+                | color.b() as u32;
+
+            crate::tray_state::CROSSHAIR_COLOR.store(
+                rgb,
+                Ordering::SeqCst,
+            );
+        }
+    });
+
+    // =========================
+    // 准星大小
+    // =========================
+
+    let mut crosshair_size =
+        crate::tray_state::CROSSHAIR_SIZE
+            .load(Ordering::SeqCst);
+
+    ui.horizontal(|ui| {
+        ui.label("准星大小：");
+
+        if ui
+            .add(
+                egui::Slider::new(
+                    &mut crosshair_size,
+                    4..=60,
+                )
+                .suffix(" px"),
+            )
+            .changed()
+        {
+            crate::tray_state::CROSSHAIR_SIZE.store(
+                crosshair_size,
+                Ordering::SeqCst,
+            );
+        }
+    });
+}
 
 ui.separator();
 

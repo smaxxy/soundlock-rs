@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::core::{w, PCWSTR};
 
@@ -7,6 +7,7 @@ use windows::Win32::Foundation::{
     HWND,
     LPARAM,
     LRESULT,
+    RECT,
     WPARAM,
 };
 
@@ -25,8 +26,7 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT,
 };
 
-use windows::Win32::System::LibraryLoader::
-    GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState,
@@ -72,121 +72,131 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_POPUP,
 };
 
-/// ============================================================
-/// 准星参数
-/// ============================================================
+//
+// ============================================================
+// 准星参数
+// ============================================================
+//
 
-/// 小窗口大小。
+/// 准星窗口大小。
 ///
-/// 窗口本身只有 40×40，
-/// 不创建全屏透明 Overlay。
-const WINDOW_SIZE: i32 = 40;
+/// 实际圆的大小由 UI 中的 CROSSHAIR_SIZE 控制。
+/// 80×80 很小，性能开销基本可以忽略。
+const WINDOW_SIZE: i32 = 80;
 
-/// 蓝色实心圆直径。
+/// 每隔多少毫秒检查一次：
 ///
-/// 觉得大或者小以后只需要改这里。
-const CROSSHAIR_DIAMETER: i32 = 16;
-
-/// 检查右键和开关的周期。
-///
-/// 10ms 已经足够快。
+/// - 准星开关
+/// - 鼠标右键
+/// - 颜色变化
+/// - 大小变化
 const UPDATE_INTERVAL_MS: u32 = 10;
 
-/// 背景颜色。
+/// 透明背景色。
 ///
-/// 纯黑作为透明色键。
+/// 这里故意不用纯黑。
+/// 这样 UI 里以后选择纯黑准星也能正常显示。
+///
+/// COLORREF 格式为：0x00BBGGRR
+///
+/// RGB(1,1,1)
 const TRANSPARENT_COLOR: COLORREF =
-    COLORREF(0x00000000);
+    COLORREF(0x00010101);
 
-/// 蓝色。
+/// 上一次已经绘制的颜色。
 ///
-/// COLORREF 格式实际上是：
-/// 0x00BBGGRR
-///
-/// 这里对应 RGB：
-/// R = 0
-/// G = 120
-/// B = 255
-const CROSSHAIR_COLOR: COLORREF =
-    COLORREF(0x00FFFF00);
+/// 用来判断 UI 中颜色有没有变化。
+static LAST_CROSSHAIR_COLOR: AtomicU32 =
+    AtomicU32::new(u32::MAX);
 
-/// ============================================================
-/// 启动准星后台线程
-/// ============================================================
+/// 上一次已经绘制的大小。
+///
+/// 用来判断 UI 中大小有没有变化。
+static LAST_CROSSHAIR_SIZE: AtomicU32 =
+    AtomicU32::new(u32::MAX);
+
+
+//
+// ============================================================
+// 启动准星线程
+// ============================================================
+//
 
 pub fn start_crosshair() {
     std::thread::spawn(|| {
         if let Err(e) = run_crosshair() {
-            log::error!(
-                "Crosshair thread failed: {:?}",
-                e
-            );
+            log::error!("准星线程运行失败: {:?}", e);
         }
     });
 }
 
-/// ============================================================
-/// 准星窗口过程
-/// ============================================================
+
+//
+// ============================================================
+// Window Procedure
+// ============================================================
+//
 
 unsafe extern "system" fn crosshair_wnd_proc(
     hwnd: HWND,
     msg: u32,
-    _wparam: WPARAM,
-    _lparam: LPARAM,
+    wparam: WPARAM,
+    lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        //
         // ----------------------------------------------------
         // 鼠标穿透
         // ----------------------------------------------------
         //
-        // 即使鼠标位于准星圆点上，
-        // 点击也不应该落到准星窗口本身。
+        // 鼠标即使正好位于准星上，
+        // 准星窗口也不会接收鼠标操作。
         //
-        // PUBG 仍然接收鼠标操作。
+        // PUBG 仍然正常接收鼠标。
+        //
         WM_NCHITTEST => {
-            return LRESULT(
-                HTTRANSPARENT as isize
-            );
+            return LRESULT(HTTRANSPARENT as isize);
         }
 
+        //
         // ----------------------------------------------------
-        // 防止系统自动擦背景
+        // 禁止 Windows 自动清背景
         // ----------------------------------------------------
         //
-        // 我们在 WM_PAINT 里面自己绘制背景。
         WM_ERASEBKGND => {
             return LRESULT(1);
         }
 
+        //
         // ----------------------------------------------------
         // 绘制准星
         // ----------------------------------------------------
+        //
         WM_PAINT => {
-            let mut ps =
-                PAINTSTRUCT::default();
+            let mut ps = PAINTSTRUCT::default();
 
-            let hdc =
-                BeginPaint(hwnd, &mut ps);
+            let hdc = BeginPaint(
+                hwnd,
+                &mut ps,
+            );
 
-            // ================================================
-            // 先把整个 40×40 窗口刷成黑色
-            // ================================================
             //
-            // 黑色稍后通过 LWA_COLORKEY
-            // 变成完全透明。
+            // -----------------------------------------------
+            // 先画透明背景
+            // -----------------------------------------------
+            //
+
             let background_brush =
                 CreateSolidBrush(
                     TRANSPARENT_COLOR,
                 );
 
-            let rect =
-                windows::Win32::Foundation::RECT {
-                    left: 0,
-                    top: 0,
-                    right: WINDOW_SIZE,
-                    bottom: WINDOW_SIZE,
-                };
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: WINDOW_SIZE,
+                bottom: WINDOW_SIZE,
+            };
 
             FillRect(
                 hdc,
@@ -194,38 +204,65 @@ unsafe extern "system" fn crosshair_wnd_proc(
                 background_brush,
             );
 
-            // ================================================
-            // 创建蓝色画刷
-            // ================================================
+            //
+            // -----------------------------------------------
+            // 获取当前 UI 设置的准星颜色
+            // -----------------------------------------------
+            //
+            // CROSSHAIR_COLOR 保存格式：
+            //
+            // 0x00RRGGBB
+            //
 
-            let blue_brush =
-                CreateSolidBrush(
-                    CROSSHAIR_COLOR,
+            let rgb =
+                crate::tray_state::CROSSHAIR_COLOR
+                    .load(Ordering::SeqCst);
+
+            let r =
+                ((rgb >> 16) & 0xFF) as u32;
+
+            let g =
+                ((rgb >> 8) & 0xFF) as u32;
+
+            let b =
+                (rgb & 0xFF) as u32;
+
+            //
+            // Windows COLORREF 是：
+            //
+            // 0x00BBGGRR
+            //
+
+            let colorref =
+                COLORREF(
+                    r
+                        | (g << 8)
+                        | (b << 16),
                 );
+
+            let crosshair_brush =
+                CreateSolidBrush(colorref);
 
             let old_brush =
                 SelectObject(
                     hdc,
                     HGDIOBJ(
-                        blue_brush.0,
+                        crosshair_brush.0,
                     ),
                 );
 
-            // ================================================
-            // 不要圆形边框
-            // ================================================
             //
-            // 因为你要的是：
+            // -----------------------------------------------
+            // 去掉圆形边框
+            // -----------------------------------------------
             //
-            //     蓝色实心圆
+            // 我们只需要：
             //
-            // 而不是：
+            //     实心圆
             //
-            //     蓝色空心圆
+
             let null_pen =
-                GetStockObject(
-                    NULL_PEN,
-                );
+                GetStockObject(NULL_PEN);
 
             let old_pen =
                 SelectObject(
@@ -233,30 +270,47 @@ unsafe extern "system" fn crosshair_wnd_proc(
                     null_pen,
                 );
 
-            // ================================================
-            // 圆居中
-            // ================================================
+            //
+            // -----------------------------------------------
+            // 获取当前 UI 设置的准星大小
+            // -----------------------------------------------
+            //
+
+            let diameter =
+                crate::tray_state::CROSSHAIR_SIZE
+                    .load(Ordering::SeqCst)
+                    as i32;
+
+            //
+            // 防止 UI 或配置异常导致圆超出窗口。
+            //
+
+            let diameter =
+                diameter.clamp(
+                    1,
+                    WINDOW_SIZE - 2,
+                );
+
+            //
+            // 让圆始终位于 80×80 窗口正中心。
+            //
 
             let offset =
-                (
-                    WINDOW_SIZE
-                        - CROSSHAIR_DIAMETER
-                ) / 2;
+                (WINDOW_SIZE - diameter) / 2;
 
-            Ellipse(
+            let _ = Ellipse(
                 hdc,
                 offset,
                 offset,
-                offset
-                    + CROSSHAIR_DIAMETER,
-                offset
-                    + CROSSHAIR_DIAMETER,
-            )
-            .ok();
+                offset + diameter,
+                offset + diameter,
+            );
 
-            // ================================================
+            //
+            // -----------------------------------------------
             // 恢复 GDI 对象
-            // ================================================
+            // -----------------------------------------------
+            //
 
             SelectObject(
                 hdc,
@@ -268,19 +322,17 @@ unsafe extern "system" fn crosshair_wnd_proc(
                 old_brush,
             );
 
-            DeleteObject(
+            let _ = DeleteObject(
                 HGDIOBJ(
-                    blue_brush.0,
+                    crosshair_brush.0,
                 ),
-            )
-            .ok();
+            );
 
-            DeleteObject(
+            let _ = DeleteObject(
                 HGDIOBJ(
                     background_brush.0,
                 ),
-            )
-            .ok();
+            );
 
             EndPaint(
                 hwnd,
@@ -290,51 +342,71 @@ unsafe extern "system" fn crosshair_wnd_proc(
             return LRESULT(0);
         }
 
+        //
         // ----------------------------------------------------
-        // 定时检查
+        // 每 10ms 检查状态
         // ----------------------------------------------------
+        //
         WM_TIMER => {
-            // ================================================
-            // 1. 整个程序是否退出
-            // ================================================
+            //
+            // -----------------------------------------------
+            // 程序是否真正退出
+            // -----------------------------------------------
+            //
+            // 这里读取和音频线程相同的 SHOULD_EXIT。
+            //
+            // 关闭 UI：
+            //     SHOULD_EXIT 还是 false
+            //     → 准星继续运行
+            //
+            // 托盘点击“退出”：
+            //     SHOULD_EXIT = true
+            //     → 准星结束
+            //
 
-            if crate::tray_state::SHOULD_EXIT.load(
-                Ordering::SeqCst,
-            ) {
-                DestroyWindow(hwnd);
+            if crate::tray_state::SHOULD_EXIT
+                .load(Ordering::SeqCst)
+            {
+                let _ =
+                    DestroyWindow(hwnd);
+
                 return LRESULT(0);
             }
 
-            // ================================================
-            // 2. 准星总开关
-            // ================================================
+            //
+            // -----------------------------------------------
+            // 准星总开关
+            // -----------------------------------------------
+            //
 
             let enabled =
-                crate::tray_state::
-                    CROSSHAIR_ENABLED
-                    .load(
-                        Ordering::SeqCst,
-                    );
+                crate::tray_state::CROSSHAIR_ENABLED
+                    .load(Ordering::SeqCst);
 
-            // ================================================
-            // 3. 检查鼠标右键
-            // ================================================
             //
-            // 返回值最高位为 1：
-            // 表示当前按键正处于按下状态。
+            // -----------------------------------------------
+            // 检查鼠标右键
+            // -----------------------------------------------
+            //
+            // GetAsyncKeyState 返回值最高位：
+            //
+            // 1 = 当前按住
+            // 0 = 当前没有按
+            //
+
             let right_button_down =
                 (
                     GetAsyncKeyState(
-                        VK_RBUTTON.0
-                            as i32,
-                    )
-                        as u16
+                        VK_RBUTTON.0 as i32,
+                    ) as u16
                         & 0x8000
                 ) != 0;
 
-            // ================================================
-            // 4. 最终显示逻辑
-            // ================================================
+            //
+            // -----------------------------------------------
+            // 最终显示条件
+            // -----------------------------------------------
+            //
 
             let should_show =
                 enabled
@@ -344,22 +416,118 @@ unsafe extern "system" fn crosshair_wnd_proc(
                 IsWindowVisible(hwnd)
                     .as_bool();
 
-            if should_show
-                && !currently_visible
-            {
-                ShowWindow(
-                    hwnd,
-                    SW_SHOWNOACTIVATE,
-                );
+            //
+            // -----------------------------------------------
+            // 当前颜色
+            // -----------------------------------------------
+            //
 
-                InvalidateRect(
-                    Some(hwnd),
-                    None,
-                    false,
-                );
-            } else if !should_show
-                && currently_visible
-            {
+            let current_color =
+                crate::tray_state::CROSSHAIR_COLOR
+                    .load(Ordering::SeqCst);
+
+            let last_color =
+                LAST_CROSSHAIR_COLOR
+                    .load(Ordering::SeqCst);
+
+            //
+            // -----------------------------------------------
+            // 当前大小
+            // -----------------------------------------------
+            //
+
+            let current_size =
+                crate::tray_state::CROSSHAIR_SIZE
+                    .load(Ordering::SeqCst);
+
+            let last_size =
+                LAST_CROSSHAIR_SIZE
+                    .load(Ordering::SeqCst);
+
+            //
+            // =================================================
+            // 需要显示准星
+            // =================================================
+            //
+
+            if should_show {
+                //
+                // ---------------------------------------------
+                // 当前隐藏
+                // → 显示
+                // ---------------------------------------------
+                //
+
+                if !currently_visible {
+                    ShowWindow(
+                        hwnd,
+                        SW_SHOWNOACTIVATE,
+                    );
+
+                    let _ =
+                        InvalidateRect(
+                            Some(hwnd),
+                            None,
+                            false,
+                        );
+
+                    LAST_CROSSHAIR_COLOR
+                        .store(
+                            current_color,
+                            Ordering::SeqCst,
+                        );
+
+                    LAST_CROSSHAIR_SIZE
+                        .store(
+                            current_size,
+                            Ordering::SeqCst,
+                        );
+                }
+
+                //
+                // ---------------------------------------------
+                // 当前已经显示
+                // 但是 UI 改了颜色或大小
+                // → 立即重新绘制
+                // ---------------------------------------------
+                //
+
+                else if current_color != last_color
+                    || current_size != last_size
+                {
+                    let _ =
+                        InvalidateRect(
+                            Some(hwnd),
+                            None,
+                            false,
+                        );
+
+                    LAST_CROSSHAIR_COLOR
+                        .store(
+                            current_color,
+                            Ordering::SeqCst,
+                        );
+
+                    LAST_CROSSHAIR_SIZE
+                        .store(
+                            current_size,
+                            Ordering::SeqCst,
+                        );
+                }
+            }
+
+            //
+            // =================================================
+            // 不应该显示
+            // =================================================
+            //
+            // 两种情况：
+            //
+            // 1. UI 关闭了准星开关
+            // 2. 当前正在按鼠标右键
+            //
+
+            else if currently_visible {
                 ShowWindow(
                     hwnd,
                     SW_HIDE,
@@ -369,11 +537,15 @@ unsafe extern "system" fn crosshair_wnd_proc(
             return LRESULT(0);
         }
 
+        //
         // ----------------------------------------------------
-        // Window 被销毁
+        // 窗口销毁
         // ----------------------------------------------------
+        //
+
         WM_DESTROY => {
             PostQuitMessage(0);
+
             return LRESULT(0);
         }
 
@@ -383,14 +555,17 @@ unsafe extern "system" fn crosshair_wnd_proc(
     DefWindowProcW(
         hwnd,
         msg,
-        _wparam,
-        _lparam,
+        wparam,
+        lparam,
     )
 }
 
-/// ============================================================
-/// 创建并运行准星窗口
-/// ============================================================
+
+//
+// ============================================================
+// 创建准星窗口
+// ============================================================
+//
 
 fn run_crosshair()
     -> windows::core::Result<()>
@@ -402,9 +577,11 @@ fn run_crosshair()
         let class_name =
             w!("SoundLockCrosshairWindow");
 
-        // ====================================================
-        // 注册窗口类
-        // ====================================================
+        //
+        // ----------------------------------------------------
+        // 注册 Win32 Window Class
+        // ----------------------------------------------------
+        //
 
         let wc =
             WNDCLASSEXW {
@@ -445,9 +622,11 @@ fn run_crosshair()
 
         RegisterClassExW(&wc);
 
-        // ====================================================
-        // 获取主屏幕大小
-        // ====================================================
+        //
+        // ----------------------------------------------------
+        // 获取主显示器分辨率
+        // ----------------------------------------------------
+        //
 
         let screen_width =
             GetSystemMetrics(
@@ -459,6 +638,12 @@ fn run_crosshair()
                 SM_CYSCREEN,
             );
 
+        //
+        // ----------------------------------------------------
+        // 让 80×80 的准星窗口本身居中
+        // ----------------------------------------------------
+        //
+
         let x =
             screen_width / 2
                 - WINDOW_SIZE / 2;
@@ -467,22 +652,47 @@ fn run_crosshair()
             screen_height / 2
                 - WINDOW_SIZE / 2;
 
-        // ====================================================
-        // 创建窗口
-        // ====================================================
+        //
+        // ----------------------------------------------------
+        // 创建准星窗口
+        // ----------------------------------------------------
+        //
 
         let hwnd =
             CreateWindowExW(
+                //
+                // 永远置顶
+                //
                 WS_EX_TOPMOST
+
+                    //
+                    // 分层窗口
+                    // 允许 ColorKey 透明
+                    //
                     | WS_EX_LAYERED
+
+                    //
+                    // 鼠标穿透
+                    //
                     | WS_EX_TRANSPARENT
+
+                    //
+                    // 不出现在 Alt+Tab
+                    //
                     | WS_EX_TOOLWINDOW
+
+                    //
+                    // 不抢 PUBG 焦点
+                    //
                     | WS_EX_NOACTIVATE,
 
                 class_name,
 
                 w!(""),
 
+                //
+                // 无边框 Popup
+                //
                 WS_POPUP,
 
                 x,
@@ -501,9 +711,13 @@ fn run_crosshair()
                 None,
             )?;
 
-        // ====================================================
-        // 黑色变成完全透明
-        // ====================================================
+        //
+        // ----------------------------------------------------
+        // 设置背景透明色
+        // ----------------------------------------------------
+        //
+        // 所有 RGB(1,1,1) 的像素都会变透明。
+        //
 
         SetLayeredWindowAttributes(
             hwnd,
@@ -512,44 +726,50 @@ fn run_crosshair()
             LWA_COLORKEY,
         )?;
 
-        // ====================================================
+        //
+        // ----------------------------------------------------
         // 默认隐藏
-        // ====================================================
+        // ----------------------------------------------------
         //
-        // CROSSHAIR_ENABLED 初始值是 false。
+        // 因为 tray_state.rs 中：
         //
-        // 等 UI 打开开关以后才显示。
+        // CROSSHAIR_ENABLED = false
+        //
+
         ShowWindow(
             hwnd,
             SW_HIDE,
         );
 
-        // ====================================================
-        // 启动 10ms Timer
-        // ====================================================
+        //
+        // ----------------------------------------------------
+        // 每 10ms 触发一次 WM_TIMER
+        // ----------------------------------------------------
+        //
 
         SetTimer(
-    Some(hwnd),
-    1,
-    UPDATE_INTERVAL_MS,
-    None,
-);
+            Some(hwnd),
+            1,
+            UPDATE_INTERVAL_MS,
+            None,
+        );
 
-        // ====================================================
-        // 独立消息循环
-        // ====================================================
         //
-        // 这个线程和 eframe UI 完全独立。
+        // ----------------------------------------------------
+        // 独立 Windows 消息循环
+        // ----------------------------------------------------
         //
-        // UI退出：
-        //     此线程继续。
+        // 这个线程完全不依赖 eframe UI。
         //
-        // 托盘退出：
-        //     SHOULD_EXIT=true
-        //     → DestroyWindow()
-        //     → WM_DESTROY
-        //     → PostQuitMessage
-        //     → 线程结束。
+        // 所以：
+        //
+        // UI关闭
+        // ↓
+        // eframe释放
+        // ↓
+        // crosshair.rs 仍然继续
+        //
+
         let mut msg =
             MSG::default();
 
