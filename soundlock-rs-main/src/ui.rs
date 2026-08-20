@@ -4,6 +4,7 @@ use cpal::Device;
 use cpal::traits::{DeviceTrait, HostTrait};
 use egui::*;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 pub struct SettingsWindow {
@@ -250,16 +251,54 @@ impl eframe::App for SettingsWindow {
                     ui.spacing_mut().item_spacing = Vec2::new(10.0, 10.0);
                     ui.heading("Sound Lock 全频降音");
                     ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("状态：");
-                        let (color, text) = if is_limiting {
-                            (Color32::from_rgb(0, 200, 0), "运行中")
-                        } else {
-                            (Color32::GRAY, "未运行")
-                        };
-                        ui.colored_label(color, text);
-                    });
-                    ui.separator();
+                   ui.horizontal(|ui| {
+    ui.label("状态：");
+
+    let (color, text) = if is_limiting {
+        (Color32::from_rgb(0, 200, 0), "运行中")
+    } else {
+        (Color32::GRAY, "未运行")
+    };
+
+    ui.colored_label(color, text);
+});
+
+// ========================================================
+// 屏幕准星开关
+// ========================================================
+//
+// UI 只负责修改一个 AtomicBool。
+// 真正的准星窗口运行在独立 crosshair 线程中。
+//
+// 因此关闭 UI 后：
+// - 准星不会退出
+// - 音频不会退出
+// - eframe UI 本身可以正常释放
+//
+let mut crosshair_enabled =
+    crate::tray_state::CROSSHAIR_ENABLED
+        .load(Ordering::SeqCst);
+
+ui.horizontal(|ui| {
+    ui.label("屏幕准星：");
+
+    if ui
+        .checkbox(
+            &mut crosshair_enabled,
+            "开启",
+        )
+        .changed()
+    {
+        crate::tray_state::CROSSHAIR_ENABLED.store(
+            crosshair_enabled,
+            Ordering::SeqCst,
+        );
+    }
+
+    ui.label("需无边框（右键隐藏）");
+});
+
+ui.separator();
 
                     ui.group(|ui| {
                         ui.horizontal(|ui| {

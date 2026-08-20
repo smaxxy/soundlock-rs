@@ -3,6 +3,7 @@
 mod audio;
 mod config;
 mod diagnostics;
+mod crosshair;
 mod setup;
 mod tray_state;
 mod ui;
@@ -191,14 +192,18 @@ fn main() -> Result<(), ()> {
         ..Default::default()
     };
 
-    let app_state = Arc::new(Mutex::new(AppState::default()));
-    let config = Config::load().unwrap_or_else(|e| {
-        log::error!("加载配置失败: {}, 将使用默认配置", e);
-        Arc::new(Mutex::new(Config::default()))
-    });
+   let app_state = Arc::new(Mutex::new(AppState::default()));
 
-    eframe::run_native(
-        "Sound Lock Rust",
+let config = Config::load().unwrap_or_else(|e| {
+    log::error!("加载配置失败: {}, 将使用默认配置", e);
+    Arc::new(Mutex::new(Config::default()))
+});
+
+// 启动准星后台线程
+crosshair::start_crosshair();
+
+eframe::run_native(
+    "Sound Lock Rust",
         native_options,
         Box::new(|_| {
             Ok(Box::new(SettingsWindow::new(
