@@ -42,7 +42,7 @@ const PEAK_RELEASE_MS: u32 = 50;
 ///
 /// Limiter 可以提前看到枪声瞬态，
 /// 在真正输出枪声之前先把 Gain 压下来。
-const LOOKAHEAD_MS: u32 = 2;
+const LOOKAHEAD_MS: u32 = 5;
 
 /// ============================================================
 /// 脚步增强参数
@@ -704,11 +704,8 @@ impl LoudnessLimiter {
         // ========================================================
 
         let energy =
-            (
-                enhanced_left * enhanced_left
-                    + enhanced_right
-                        * enhanced_right
-            ) * 0.5;
+    (enhanced_left * enhanced_left)
+        .max(enhanced_right * enhanced_right);
 
         self.fullband_rms =
             energy
@@ -787,16 +784,18 @@ impl LoudnessLimiter {
         // 所以发现 Peak 后，
         // 把它需要的 Gain 至少保持一个 Lookahead 窗口。
         if peak_target_gain < 1.0 {
-            self.peak_hold_gain =
-                peak_target_gain;
+    // Hold 期间只允许压得更多，
+    // 不允许后面的较小 Peak 提前把 Gain 放回来。
+    self.peak_hold_gain =
+        self.peak_hold_gain.min(peak_target_gain);
 
-            self.peak_hold_counter =
-                self.lookahead_samples;
-        } else if self.peak_hold_counter > 0 {
-            self.peak_hold_counter -= 1;
-        } else {
-            self.peak_hold_gain = 1.0;
-        }
+    self.peak_hold_counter =
+        self.lookahead_samples;
+} else if self.peak_hold_counter > 0 {
+    self.peak_hold_counter -= 1;
+} else {
+    self.peak_hold_gain = 1.0;
+}
 
         let peak_control_target =
             self.peak_hold_gain;
@@ -833,13 +832,13 @@ impl LoudnessLimiter {
                 .min(self.peak_gain_smoother);
 
         // ========================================================
-        // 11. 2ms Lookahead
+        // 11. 5ms Lookahead
         // ========================================================
         //
         // 当前声音先进入 detector，
-        // 但真正输出的是 2ms 以前的声音。
+        // 但真正输出的是 5ms 以前的声音。
         //
-        // 因此 Limiter 相当于提前 2ms
+        // 因此 Limiter 相当于提前 5ms
         // “知道”枪声马上要输出。
         let delayed_left =
             self.lookahead_l[
