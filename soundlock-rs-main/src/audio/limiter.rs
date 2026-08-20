@@ -55,7 +55,7 @@ const LOOKAHEAD_MS: u32 = 5;
 const FOOTSTEP_EQ_FREQ_HZ: f32 = 2500.0;
 
 /// Presence EQ 最大提升。
-const FOOTSTEP_EQ_GAIN_DB: f32 = 3.0;
+const FOOTSTEP_EQ_GAIN_DB: f32 = 1.5;
 
 /// EQ Q 值。
 ///
@@ -81,13 +81,17 @@ const DETAIL_FULL_DB: f32 = -38.0;
 ///
 /// 枪声、爆炸等大声音不会继续吃这 3 dB + 3 dB 增强。
 const DETAIL_OFF_DB: f32 = -20.0;
+const DETAIL_PEAK_FULL_DB: f32 = -24.0;
 
+/// Peak 到这个值以后，立即关闭当前帧的脚步增强
+const DETAIL_PEAK_OFF_DB: f32 = -12.0;
 /// 小声音出现后，脚步增强逐渐打开。
 const DETAIL_ENABLE_MS: u32 = 30;
 
 /// 突然出现枪声等大声音时，
 /// 快速关闭脚步增强。
 const DETAIL_DISABLE_MS: u32 = 5;
+/// 短促 Peak 低于这个值时，不影响脚步增强
 
 /// ============================================================
 /// 简单 Biquad Peaking EQ
@@ -620,7 +624,14 @@ impl LoudnessLimiter {
 
         let raw_db =
             Self::linear_to_db(raw_rms);
+// 检测瞬时 Peak。
+// RMS 对非常短的换弹声、金属点击声反应比较慢，
+// 所以额外用 Peak 防止这些声音被脚步增强放大。
+let raw_peak =
+    left.abs().max(right.abs());
 
+let raw_peak_db =
+    Self::linear_to_db(raw_peak);
         // ========================================================
         // 2. 动态脚步增强 Amount
         // ========================================================
@@ -652,8 +663,12 @@ impl LoudnessLimiter {
             self.detail_amount_smoother
                 .clamp(0.0, 1.0);
 
-        let detail_amount =
-            self.detail_amount_smoother;
+       let peak_guard =
+    Self::calc_detail_peak_guard(raw_peak_db);
+
+let detail_amount =
+    self.detail_amount_smoother
+        * peak_guard;
 
         // ========================================================
         // 3. 动态 Presence EQ
@@ -1055,7 +1070,35 @@ impl LoudnessLimiter {
     /// ========================================================
     /// Lookahead frame 数
     /// ========================================================
+#[inline]
+fn calc_detail_peak_guard(
+    peak_db: f32,
+) -> f32 {
+    if !peak_db.is_finite() {
+        return 0.0;
+    }
 
+    // 小 Peak：完全允许脚步增强
+    if peak_db <= DETAIL_PEAK_FULL_DB {
+        return 1.0;
+    }
+
+    // 大 Peak：完全禁止脚步增强
+    if peak_db >= DETAIL_PEAK_OFF_DB {
+        return 0.0;
+    }
+
+    // -24dB → -12dB
+    // 从 1.0 平滑下降到 0.0
+    (
+        (DETAIL_PEAK_OFF_DB - peak_db)
+            / (
+                DETAIL_PEAK_OFF_DB
+                    - DETAIL_PEAK_FULL_DB
+            )
+    )
+        .clamp(0.0, 1.0)
+}
     fn calc_lookahead_samples(
         time_ms: u32,
         sr: f32,
