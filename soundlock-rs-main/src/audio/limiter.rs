@@ -55,7 +55,7 @@ const LOOKAHEAD_MS: u32 = 5;
 const FOOTSTEP_EQ_FREQ_HZ: f32 = 2500.0;
 
 /// Presence EQ 最大提升。
-const FOOTSTEP_EQ_GAIN_DB: f32 = 1.5;
+const FOOTSTEP_EQ_GAIN_DB: f32 = 0.5;
 
 /// EQ Q 值。
 ///
@@ -67,7 +67,7 @@ const FOOTSTEP_EQ_Q: f32 = 0.9;
 ///
 /// 与动态 EQ 配合时，
 /// 脚步等较小声音会更容易听见。
-const FOOTSTEP_UPWARD_GAIN_DB: f32 = 3.0;
+const FOOTSTEP_UPWARD_GAIN_DB: f32 = 2.0;
 
 /// 太安静时不增强。
 ///
@@ -81,10 +81,10 @@ const DETAIL_FULL_DB: f32 = -38.0;
 ///
 /// 枪声、爆炸等大声音不会继续吃这 3 dB + 3 dB 增强。
 const DETAIL_OFF_DB: f32 = -20.0;
-const DETAIL_PEAK_FULL_DB: f32 = -24.0;
+const DETAIL_PEAK_FULL_DB: f32 = -30.0;
 
 /// Peak 到这个值以后，立即关闭当前帧的脚步增强
-const DETAIL_PEAK_OFF_DB: f32 = -12.0;
+const DETAIL_PEAK_OFF_DB: f32 = -18.0;
 /// 小声音出现后，脚步增强逐渐打开。
 const DETAIL_ENABLE_MS: u32 = 30;
 
