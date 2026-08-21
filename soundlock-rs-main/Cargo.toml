@@ -31,6 +31,7 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Variant",
     "Win32_Devices_Properties",
+    "Win32_UI_HiDpi",
     "Win32_UI_Shell",                     # 托盘图标 API
     "Win32_System_LibraryLoader",         # GetModuleHandleW
     "Win32_Graphics_Gdi",                 # RegisterClassExW, LoadIconW, etc.
