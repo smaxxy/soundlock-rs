@@ -8,7 +8,7 @@ pub use limiter::LoudnessLimiter;
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::HeapRb;
 
-use crate::config::Config;
+use crate::config::{Config, RuntimeLimiterParams};
 use crate::AppState;
 
 use std::{
@@ -19,23 +19,22 @@ use std::{
 pub fn start_limiter(
     state: Arc<Mutex<AppState>>,
     config: Arc<Mutex<Config>>,
+    runtime_params: Arc<RuntimeLimiterParams>,
 ) {
     std::thread::spawn(move || {
-        run_limiter_loop_cable(state, config);
+        run_limiter_loop_cable(
+            state,
+            config,
+            runtime_params,
+        );
     });
 }
 
 fn run_limiter_loop_cable(
     state: Arc<Mutex<AppState>>,
     config: Arc<Mutex<Config>>,
+    runtime_params: Arc<RuntimeLimiterParams>,
 ) {
-    let limiter =
-        Arc::new(Mutex::new(
-            LoudnessLimiter::new(
-                Arc::clone(&config),
-            ),
-        ));
-
     // ========================================================
     // 读取输入 / 输出设备
     // ========================================================
@@ -207,16 +206,25 @@ fn run_limiter_loop_cable(
     }
 
     // ========================================================
-    // 设置真实采样率
+    // 创建 Limiter，并设置真实采样率
     // ========================================================
+    //
+    // Limiter 不再放进 Arc<Mutex<...>>。
+    //
+    // 它会在下面被 move 进 Input Callback，
+    // 由该实时回调独占整个生命周期。
+    //
+    // UI / 控制线程只通过 RuntimeLimiterParams
+    // 发布参数，不直接访问 Limiter。
 
-    if let Ok(mut l) =
-        limiter.lock()
-    {
-        l.set_sample_rate(
-            stream_config.sample_rate as f32,
+    let mut limiter =
+        LoudnessLimiter::new(
+            Arc::clone(&runtime_params),
         );
-    }
+
+    limiter.set_sample_rate(
+        stream_config.sample_rate as f32,
+    );
 
     // ========================================================
     // Ring Buffer
@@ -256,9 +264,28 @@ fn run_limiter_loop_cable(
     // ========================================================
     // Input Callback
     // ========================================================
-
-    let limiter_clone =
-        Arc::clone(&limiter);
+    //
+    // 当前数据流保持不变：
+    //
+    // Input
+    //   ↓
+    // Limiter
+    //   ↓
+    // Ring Buffer
+    //   ↓
+    // Output
+    //
+    // 与旧版不同的是：
+    //
+    // LoudnessLimiter 现在直接被这个 callback closure 独占，
+    // 不再通过 Arc<Mutex<LoudnessLimiter>> 跨线程共享。
+    //
+    // 因此实时音频路径中：
+    //
+    // - 没有 limiter.lock()
+    // - 没有 limiter.try_lock()
+    // - 没有 limiter_lock_miss
+    // - 不会因为 UI / 控制线程占锁而旁路 Limiter
 
     let input_data_fn =
         move |
@@ -269,117 +296,89 @@ fn run_limiter_loop_cable(
                 input_callback();
 
             // ================================================
-            // 成功获得 Limiter 锁
+            // 每个 Audio Callback 只同步一次参数
             // ================================================
+            //
+            // 正常情况下只检查一次 Atomic version。
+            //
+            // 只有 UI 发布了新参数时，
+            // 才会读取新快照并重新计算相关系数。
+            //
+            // process_stereo_frame() 内部不会再次检查版本。
+            limiter.begin_audio_callback();
 
-            if let Ok(mut l) =
-                limiter_clone.try_lock()
+            // ================================================
+            // Stereo Frame 处理
+            // ================================================
+            //
+            // data:
+            //
+            // L R L R L R ...
+            //
+            // 左右声道必须作为同一个 Stereo Frame
+            // 一起交给 Limiter，保证：
+            //
+            // - Stereo Linked RMS
+            // - Stereo Linked Peak
+            // - 左右共用同一个 Gain
+            // - 不破坏 PUBG 方位感
+
+            let mut frames =
+                data.chunks_exact(2);
+
+            for frame in
+                &mut frames
             {
-                // --------------------------------------------
-                // 非常重要：
-                //
-                // data 是：
-                //
-                // L R L R L R L R ...
-                //
-                // 以前：
-                //
-                // for sample {
-                //     process_sample(sample)
-                // }
-                //
-                // 会导致左右声道被当成连续的 Mono sample。
-                //
-                // 现在必须：
-                //
-                // L + R
-                //   ↓
-                // process_stereo_frame()
-                //
-                // 左右共用同一套 RMS / Peak / Gain。
-                // --------------------------------------------
+                let left =
+                    frame[0];
 
-                let mut frames =
-                    data.chunks_exact(2);
+                let right =
+                    frame[1];
 
-                for frame in
-                    &mut frames
-                {
-                    let left =
-                        frame[0];
-
-                    let right =
-                        frame[1];
-
-                    let (
-                        processed_left,
-                        processed_right,
-                    ) =
-                        l.process_stereo_frame(
+                let (
+                    processed_left,
+                    processed_right,
+                ) =
+                    limiter
+                        .process_stereo_frame(
                             left,
                             right,
                         );
 
-                    // 左声道
-                    if producer
-                        .try_push(
-                            processed_left,
-                        )
-                        .is_err()
-                    {
-                        crate::diagnostics::
-                            ring_push_drop();
-                    }
-
-                    // 右声道
-                    if producer
-                        .try_push(
-                            processed_right,
-                        )
-                        .is_err()
-                    {
-                        crate::diagnostics::
-                            ring_push_drop();
-                    }
-                }
-
-                // 理论上 Stereo callback
-                // 不应该出现奇数 sample。
-                //
-                // 这里仍做最后保险，
-                // 避免极端情况下直接丢数据。
-                for &sample in
-                    frames.remainder()
+                // 左声道
+                if producer
+                    .try_push(
+                        processed_left,
+                    )
+                    .is_err()
                 {
-                    if producer
-                        .try_push(sample)
-                        .is_err()
-                    {
-                        crate::diagnostics::
-                            ring_push_drop();
-                    }
+                    crate::diagnostics::
+                        ring_push_drop();
                 }
-            } else {
-                // ============================================
-                // Limiter 锁暂时拿不到
-                // ============================================
-                //
-                // 不阻塞实时音频线程，
-                // 直接原样送入 Ring Buffer。
-                //
-                crate::diagnostics::
-                    limiter_lock_miss();
 
-                for &sample in data {
-                    if producer
-                        .try_push(sample)
-                        .is_err()
-                    {
-                        crate::diagnostics::
-                            ring_push_drop();
-                    }
+                // 右声道
+                if producer
+                    .try_push(
+                        processed_right,
+                    )
+                    .is_err()
+                {
+                    crate::diagnostics::
+                        ring_push_drop();
                 }
             }
+
+            // Stereo interleaved callback 正常情况下
+            // data.len() 必须是 2 的整数倍。
+            //
+            // 如果极端情况下出现 1 个 remainder sample，
+            // 这里故意不把它单独写入 Ring Buffer。
+            //
+            // 原因：
+            // 单独写入一个 sample 会让后续 L/R 交错相位错位，
+            // 比丢掉这个异常 sample 更严重。
+            let _ =
+                frames.remainder();
         };
 
     // ========================================================
@@ -574,13 +573,6 @@ fn run_limiter_loop_cable(
             || should_exit
         {
             break;
-        }
-
-        // 每秒同步 UI 参数。
-        if let Ok(mut l) =
-            limiter.try_lock()
-        {
-            l.update_parameters();
         }
 
         std::thread::sleep(

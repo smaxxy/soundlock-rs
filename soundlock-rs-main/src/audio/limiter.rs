@@ -1,378 +1,268 @@
-use crate::config::Config;
-use std::f32::consts::PI;
-use std::sync::{Arc, Mutex};
+use crate::config::{
+    LimiterParams,
+    RuntimeLimiterParams,
+};
+use std::sync::Arc;
 
 /// ============================================================
-/// PUBG Sound Lock 参数
+/// 固定 DSP 参数
 /// ============================================================
 
-/// Peak 最终上限。
-///
-/// 枪声、爆炸等极端瞬态最终不会超过 -3 dBFS。
+/// 最终 Peak Ceiling。
 const PEAK_THRESHOLD_DB: f32 = -3.0;
 
-/// RMS 检测器时间常数。
+/// RMS Detector 时间常数。
 ///
-/// 注意：
-/// 这不是 UI 中的 Attack。
-/// 它控制 RMS 检测器观察声音能量变化的速度。
+/// 固定，不放 UI。
 const RMS_DETECTOR_MS: u32 = 10;
 
-/// RMS Soft Knee 宽度。
+/// RMS Soft Knee。
 ///
-/// 6 dB 表示在阈值上下各约 3 dB 的范围内
-/// 平滑进入限制状态，减少突然“压下去”的感觉。
+/// 固定，不放 UI。
 const RMS_KNEE_DB: f32 = 6.0;
 
 /// Peak Attack。
 ///
-/// 配合 Lookahead 使用。
+/// 配合 5ms Lookahead 使用。
 const PEAK_ATTACK_MS: u32 = 1;
 
-/// Peak Release。
-///
-/// 与 RMS Release 完全独立。
-const PEAK_RELEASE_MS: u32 = 50;
-
 /// Lookahead 时间。
-///
-/// 48 kHz 下：
-///
-/// 2 ms = 96 个 stereo frame。
-///
-/// Limiter 可以提前看到枪声瞬态，
-/// 在真正输出枪声之前先把 Gain 压下来。
 const LOOKAHEAD_MS: u32 = 5;
 
-/// ============================================================
-/// 脚步增强参数
-/// ============================================================
-
-/// PUBG 中脚步、衣物摩擦等细节比较明显的存在感频段。
+/// Pre-Gain 参数改变后的平滑时间。
 ///
-/// 这里不是把整个高频暴力拉起来，
-/// 而是轻度突出约 2.5 kHz 附近。
-const FOOTSTEP_EQ_FREQ_HZ: f32 = 2500.0;
+/// 防止 UI 拖动 Pre-Gain 时产生突变 / click。
+const PRE_GAIN_SMOOTH_MS: u32 = 20;
 
-/// Presence EQ 最大提升。
-const FOOTSTEP_EQ_GAIN_DB: f32 = 0.5;
-
-/// EQ Q 值。
+/// Gain 低于这个值时，
+/// Diagnostics 认为 Limiter 正在工作。
 ///
-/// 数值不高，让增强范围稍宽，
-/// 避免声音过于尖锐。
-const FOOTSTEP_EQ_Q: f32 = 0.9;
+/// 0.999 约等于 -0.0087 dB。
+const LIMIT_ACTIVE_GAIN: f32 = 0.999;
 
-/// 小声音最大额外提升。
+/// Limiter 本地累计多少 Stereo Frame
+/// 后批量提交一次 Diagnostics。
 ///
-/// 与动态 EQ 配合时，
-/// 脚步等较小声音会更容易听见。
-const FOOTSTEP_UPWARD_GAIN_DB: f32 = 2.0;
-
-/// 太安静时不增强。
-///
-/// 避免把非常低的底噪无限抬起来。
-const DETAIL_MIN_DB: f32 = -60.0;
-
-/// 这个音量附近脚步增强达到最大。
-const DETAIL_FULL_DB: f32 = -38.0;
-
-/// 到这个音量以后逐渐关闭脚步增强。
-///
-/// 枪声、爆炸等大声音不会继续吃这 3 dB + 3 dB 增强。
-const DETAIL_OFF_DB: f32 = -20.0;
-const DETAIL_PEAK_FULL_DB: f32 = -30.0;
-
-/// Peak 到这个值以后，立即关闭当前帧的脚步增强
-const DETAIL_PEAK_OFF_DB: f32 = -18.0;
-/// 小声音出现后，脚步增强逐渐打开。
-const DETAIL_ENABLE_MS: u32 = 30;
-
-/// 突然出现枪声等大声音时，
-/// 快速关闭脚步增强。
-const DETAIL_DISABLE_MS: u32 = 5;
-/// 短促 Peak 低于这个值时，不影响脚步增强
-
-/// ============================================================
-/// 简单 Biquad Peaking EQ
-/// ============================================================
-
-#[derive(Clone, Copy)]
-struct Biquad {
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
-
-    z1: f32,
-    z2: f32,
-}
-
-impl Biquad {
-    fn new() -> Self {
-        Self {
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-            a1: 0.0,
-            a2: 0.0,
-
-            z1: 0.0,
-            z2: 0.0,
-        }
-    }
-
-    /// 设置 Peaking EQ。
-    ///
-    /// 使用标准 RBJ Audio EQ Cookbook 形式。
-    fn set_peaking(
-        &mut self,
-        sample_rate: f32,
-        frequency: f32,
-        q: f32,
-        gain_db: f32,
-    ) {
-        if sample_rate <= 0.0 {
-            return;
-        }
-
-        let frequency =
-            frequency.clamp(20.0, sample_rate * 0.45);
-
-        let a =
-            10.0f32.powf(gain_db / 40.0);
-
-        let omega =
-            2.0 * PI * frequency / sample_rate;
-
-        let sin_omega = omega.sin();
-        let cos_omega = omega.cos();
-
-        let alpha =
-            sin_omega / (2.0 * q.max(0.01));
-
-        let b0 =
-            1.0 + alpha * a;
-
-        let b1 =
-            -2.0 * cos_omega;
-
-        let b2 =
-            1.0 - alpha * a;
-
-        let a0 =
-            1.0 + alpha / a;
-
-        let a1 =
-            -2.0 * cos_omega;
-
-        let a2 =
-            1.0 - alpha / a;
-
-        self.b0 = b0 / a0;
-        self.b1 = b1 / a0;
-        self.b2 = b2 / a0;
-
-        self.a1 = a1 / a0;
-        self.a2 = a2 / a0;
-    }
-
-    #[inline]
-    fn process(&mut self, sample: f32) -> f32 {
-        // Transposed Direct Form II
-        let output =
-            self.b0 * sample + self.z1;
-
-        self.z1 =
-            self.b1 * sample
-                - self.a1 * output
-                + self.z2;
-
-        self.z2 =
-            self.b2 * sample
-                - self.a2 * output;
-
-        output
-    }
-
-    fn reset(&mut self) {
-        self.z1 = 0.0;
-        self.z2 = 0.0;
-    }
-}
+/// 避免每个 Sample 都写全局 Atomic。
+const DIAGNOSTIC_FLUSH_FRAMES: u64 = 4096;
 
 /// ============================================================
 /// Loudness Limiter
 /// ============================================================
-
+///
+/// 最终职责：
+///
+/// RuntimeLimiterParams
+///         ↓
+///      Pre-Gain
+///         ↓
+/// Stereo Linked RMS
+///         ↓
+/// RMS Soft Knee Limiter
+///         ↓
+/// Stereo Linked Peak
+///         ↓
+/// Peak Hold
+///         ↓
+/// Peak Attack / Release
+///         ↓
+/// RMS / Peak 取更严格 Gain
+///         ↓
+///     5ms Lookahead
+///         ↓
+///    -3 dBFS Ceiling
+///
+/// ============================================================
+///
+/// 重要：
+///
+/// LoudnessLimiter 不再持有：
+///
+/// Arc<Mutex<Config>>
+///
+/// Audio Callback 不会：
+///
+/// - Mutex
+/// - RwLock
+/// - try_lock
+/// - 等待 UI
+///
+/// UI 参数通过 RuntimeLimiterParams
+/// 使用 Atomic + version 发布。
 pub struct LoudnessLimiter {
-    config: Arc<Mutex<Config>>,
+    // ========================================================
+    // 实时参数通道
+    // ========================================================
 
-    /// 当前真实采样率
+    /// UI / 控制线程发布参数的无锁通道。
+    runtime_params:
+        Arc<RuntimeLimiterParams>,
+
+    /// Limiter 当前正在使用的参数快照。
+    ///
+    /// set_sample_rate() 重新计算系数时直接使用这里，
+    /// 不需要访问 Config。
+    current_params:
+        LimiterParams,
+
+    /// 上一次成功同步的参数版本。
+    ///
+    /// 初始化为 u64::MAX，
+    /// 强制第一次 Audio Callback
+    /// 再读取一次 RuntimeLimiterParams。
+    last_parameter_version: u64,
+
+    // ========================================================
+    // Sample Rate
+    // ========================================================
+
     sample_rate: f32,
 
     // ========================================================
-    // RMS 全频控制
+    // Pre-Gain
     // ========================================================
 
-    /// RMS 阈值 dBFS
+    /// 当前目标 Pre-Gain。
+    pre_gain_target_linear: f32,
+
+    /// 实际正在使用的平滑后 Pre-Gain。
+    pre_gain_smoother: f32,
+
+    /// Pre-Gain 20ms 平滑系数。
+    pre_gain_smooth_coeff: f32,
+
+    // ========================================================
+    // RMS
+    // ========================================================
+
+    /// 当前 RMS Threshold。
     threshold_db: f32,
 
-    /// RMS 阈值线性值
-    threshold_linear: f32,
-
-    /// RMS Attack
+    /// RMS Gain Attack。
     attack_coeff: f32,
 
-    /// RMS Release
+    /// RMS Gain Release。
     release_coeff: f32,
 
-    /// RMS Detector 系数
+    /// 固定 10ms RMS Detector。
     rms_detector_coeff: f32,
 
-    /// RMS 能量状态
+    /// Stereo Linked RMS 能量状态。
     fullband_rms: f32,
 
-    /// RMS Gain
+    /// RMS Limiter 当前 Gain。
     gain_smoother: f32,
 
     // ========================================================
-    // Peak 瞬态保护
+    // Peak
     // ========================================================
 
-    /// Peak 阈值
+    /// -3 dBFS Peak Ceiling 线性值。
     peak_threshold_linear: f32,
 
-    /// Peak Attack
+    /// Peak 1ms Attack。
     peak_attack_coeff: f32,
 
-    /// Peak Release
+    /// Peak Release。
+    ///
+    /// 来自 UI：
+    /// 20 ~ 150 ms。
     peak_release_coeff: f32,
 
-    /// Peak Gain
+    /// Peak Limiter 当前 Gain。
     peak_gain_smoother: f32,
 
-    /// Lookahead 期间需要保持的 Peak 目标增益。
-    ///
-    /// 主要用于非常短的枪声瞬态。
+    /// 当前 Hold 期间最严格的 Peak Gain。
     peak_hold_gain: f32,
 
-    /// Peak Hold 剩余 frame 数。
+    /// Peak Hold 剩余 Stereo Frame。
     peak_hold_counter: usize,
+
+    /// 当前是否处于一次 Peak Hold Event。
+    ///
+    /// 用于 Diagnostics：
+    /// 连续 Peak 只统计为一个事件。
+    peak_hold_active: bool,
 
     // ========================================================
     // Lookahead
     // ========================================================
 
-    /// Lookahead frame 数量。
+    /// Lookahead Stereo Frame 数量。
     lookahead_samples: usize,
 
-    /// 左声道延迟缓冲区
+    /// 左声道 Lookahead Ring Buffer。
     lookahead_l: Vec<f32>,
 
-    /// 右声道延迟缓冲区
+    /// 右声道 Lookahead Ring Buffer。
     lookahead_r: Vec<f32>,
 
-    /// 当前 ring buffer 位置
+    /// Ring Buffer 当前位置。
     lookahead_pos: usize,
 
     // ========================================================
-    // 脚步 / 小声音增强
+    // 本地 Diagnostics
     // ========================================================
+    //
+    // 先在 Limiter 本地累积，
+    // 每 4096 frame 再批量提交，
+    // 避免实时线程每帧频繁 Atomic 操作。
 
-    /// 原始输入的 RMS 能量状态。
-    ///
-    /// 用它决定当前是否应该开启脚步增强。
-    detail_rms: f32,
+    diagnostic_processed_frames: u64,
 
-    /// 当前脚步增强程度：
-    ///
-    /// 0.0 = 完全关闭
-    /// 1.0 = 最大增强
-    detail_amount_smoother: f32,
+    diagnostic_ceiling_hit_frames: u64,
 
-    /// 小声音增强打开速度
-    detail_enable_coeff: f32,
+    diagnostic_peak_limit_frames: u64,
 
-    /// 大声音出现时增强关闭速度
-    detail_disable_coeff: f32,
+    diagnostic_peak_hold_events: u64,
 
-    /// 左声道 Presence EQ
-    footstep_eq_l: Biquad,
+    diagnostic_peak_gain_min: f32,
 
-    /// 右声道 Presence EQ
-    footstep_eq_r: Biquad,
+    diagnostic_rms_gain_min: f32,
 }
 
 impl LoudnessLimiter {
-    pub fn new(config: Arc<Mutex<Config>>) -> Self {
-        // ========================================================
-        // 读取配置
-        // ========================================================
+    /// ========================================================
+    /// 创建 Limiter
+    /// ========================================================
+    ///
+    /// 注意：
+    ///
+    /// 构造参数已经从：
+    ///
+    /// Arc<Mutex<Config>>
+    ///
+    /// 改为：
+    ///
+    /// Arc<RuntimeLimiterParams>
+    ///
+    /// 下一步 audio/mod.rs 必须对应修改。
+    pub fn new(
+        runtime_params:
+            Arc<RuntimeLimiterParams>,
+    ) -> Self {
+        // ====================================================
+        // 初始化参数快照
+        // ====================================================
+        //
+        // snapshot() 只发生在创建 Limiter 时，
+        // 不属于 Audio Callback 实时路径。
+        let params =
+            runtime_params
+                .snapshot()
+                .sanitized();
 
-        let (threshold_db, attack_ms, release_ms) = config
-            .try_lock()
-            .map(|cfg| {
-                (
-                    cfg.threshold_db,
-                    cfg.attack_ms,
-                    cfg.release_ms,
-                )
-            })
-            .unwrap_or((-16.0, 10, 50));
+        // 创建时临时使用 48kHz。
+        //
+        // Audio Stream 创建完成以后，
+        // set_sample_rate() 会设置真实 SR。
+        let sample_rate =
+            48_000.0;
 
-        let sample_rate = 48000.0;
-
-        // ========================================================
-        // RMS
-        // ========================================================
-
-        let threshold_linear =
-            Self::db_to_linear(threshold_db);
-
-        let attack_coeff =
-            Self::calc_coeff(
-                attack_ms,
-                sample_rate,
-            );
-
-        let release_coeff =
-            Self::calc_coeff(
-                release_ms,
-                sample_rate,
-            );
-
-        let rms_detector_coeff =
-            Self::calc_coeff(
-                RMS_DETECTOR_MS,
-                sample_rate,
-            );
-
-        // ========================================================
-        // Peak
-        // ========================================================
-
-        let peak_threshold_linear =
+        let pre_gain_linear =
             Self::db_to_linear(
-                PEAK_THRESHOLD_DB,
+                params.pre_gain_db,
             );
-
-        let peak_attack_coeff =
-            Self::calc_coeff(
-                PEAK_ATTACK_MS,
-                sample_rate,
-            );
-
-        let peak_release_coeff =
-            Self::calc_coeff(
-                PEAK_RELEASE_MS,
-                sample_rate,
-            );
-
-        // ========================================================
-        // Lookahead
-        // ========================================================
 
         let lookahead_samples =
             Self::calc_lookahead_samples(
@@ -380,120 +270,333 @@ impl LoudnessLimiter {
                 sample_rate,
             );
 
-        let lookahead_l =
-            vec![0.0; lookahead_samples];
-
-        let lookahead_r =
-            vec![0.0; lookahead_samples];
-
-        // ========================================================
-        // Detail / Footstep
-        // ========================================================
-
-        let detail_enable_coeff =
-            Self::calc_coeff(
-                DETAIL_ENABLE_MS,
-                sample_rate,
-            );
-
-        let detail_disable_coeff =
-            Self::calc_coeff(
-                DETAIL_DISABLE_MS,
-                sample_rate,
-            );
-
-        let mut footstep_eq_l =
-            Biquad::new();
-
-        let mut footstep_eq_r =
-            Biquad::new();
-
-        footstep_eq_l.set_peaking(
-            sample_rate,
-            FOOTSTEP_EQ_FREQ_HZ,
-            FOOTSTEP_EQ_Q,
-            FOOTSTEP_EQ_GAIN_DB,
-        );
-
-        footstep_eq_r.set_peaking(
-            sample_rate,
-            FOOTSTEP_EQ_FREQ_HZ,
-            FOOTSTEP_EQ_Q,
-            FOOTSTEP_EQ_GAIN_DB,
-        );
-
         Self {
-            config,
+            // Runtime params
+            runtime_params,
 
+            current_params:
+                params,
+
+            // 故意不读取 runtime_params.version()。
+            //
+            // snapshot() 与 version() 如果分开调用，
+            // 中间可能恰好发生一次 publish。
+            //
+            // 使用 MAX 可以保证第一次
+            // begin_audio_callback()
+            // 必定重新同步一次最新参数。
+            last_parameter_version:
+                u64::MAX,
+
+            // Sample rate
             sample_rate,
+
+            // Pre-Gain
+            pre_gain_target_linear:
+                pre_gain_linear,
+
+            pre_gain_smoother:
+                pre_gain_linear,
+
+            pre_gain_smooth_coeff:
+                Self::calc_coeff(
+                    PRE_GAIN_SMOOTH_MS,
+                    sample_rate,
+                ),
 
             // RMS
-            threshold_db,
-            threshold_linear,
-            attack_coeff,
-            release_coeff,
-            rms_detector_coeff,
-            fullband_rms: 0.0,
-            gain_smoother: 1.0,
+            threshold_db:
+                params.threshold_db,
+
+            attack_coeff:
+                Self::calc_coeff(
+                    params.attack_ms,
+                    sample_rate,
+                ),
+
+            release_coeff:
+                Self::calc_coeff(
+                    params.release_ms,
+                    sample_rate,
+                ),
+
+            rms_detector_coeff:
+                Self::calc_coeff(
+                    RMS_DETECTOR_MS,
+                    sample_rate,
+                ),
+
+            fullband_rms:
+                0.0,
+
+            gain_smoother:
+                1.0,
 
             // Peak
-            peak_threshold_linear,
-            peak_attack_coeff,
-            peak_release_coeff,
-            peak_gain_smoother: 1.0,
-            peak_hold_gain: 1.0,
-            peak_hold_counter: 0,
+            peak_threshold_linear:
+                Self::db_to_linear(
+                    PEAK_THRESHOLD_DB,
+                ),
+
+            peak_attack_coeff:
+                Self::calc_coeff(
+                    PEAK_ATTACK_MS,
+                    sample_rate,
+                ),
+
+            peak_release_coeff:
+                Self::calc_coeff(
+                    params
+                        .peak_release_ms,
+                    sample_rate,
+                ),
+
+            peak_gain_smoother:
+                1.0,
+
+            peak_hold_gain:
+                1.0,
+
+            peak_hold_counter:
+                0,
+
+            peak_hold_active:
+                false,
 
             // Lookahead
             lookahead_samples,
-            lookahead_l,
-            lookahead_r,
-            lookahead_pos: 0,
 
-            // Detail
-            detail_rms: 0.0,
-            detail_amount_smoother: 0.0,
-            detail_enable_coeff,
-            detail_disable_coeff,
-            footstep_eq_l,
-            footstep_eq_r,
+            lookahead_l:
+                vec![
+                    0.0;
+                    lookahead_samples
+                ],
+
+            lookahead_r:
+                vec![
+                    0.0;
+                    lookahead_samples
+                ],
+
+            lookahead_pos:
+                0,
+
+            // Diagnostics
+            diagnostic_processed_frames:
+                0,
+
+            diagnostic_ceiling_hit_frames:
+                0,
+
+            diagnostic_peak_limit_frames:
+                0,
+
+            diagnostic_peak_hold_events:
+                0,
+
+            diagnostic_peak_gain_min:
+                1.0,
+
+            diagnostic_rms_gain_min:
+                1.0,
         }
+    }
+
+    /// ========================================================
+    /// Audio Callback 开始
+    /// ========================================================
+    ///
+    /// 下一步 audio/mod.rs 中：
+    ///
+    /// 每次 Audio Callback 开头调用一次。
+    ///
+    /// 例如：
+    ///
+    /// limiter.begin_audio_callback();
+    ///
+    /// 然后再循环处理该 Callback
+    /// 里面所有 Stereo Frame。
+    ///
+    /// ========================================================
+    ///
+    /// 正常情况下参数没有变化时：
+    ///
+    /// 这里只做一次 Atomic version load。
+    ///
+    /// 参数有变化时：
+    ///
+    /// - 读取新参数
+    /// - 重新计算相关系数
+    ///
+    /// 不会：
+    ///
+    /// - Mutex
+    /// - 等待
+    /// - spin
+    /// - 内存分配
+    #[inline]
+    pub fn begin_audio_callback(
+        &mut self,
+    ) {
+        let mut version =
+            self.last_parameter_version;
+
+        if let Some(params) =
+            self
+                .runtime_params
+                .load_if_changed(
+                    &mut version,
+                )
+        {
+            // 只有拿到了完整稳定快照，
+            // 才更新版本和 Limiter 参数。
+            self.last_parameter_version =
+                version;
+
+            self.apply_runtime_params(
+                params,
+            );
+        }
+    }
+
+    /// ========================================================
+    /// 应用新的 Runtime 参数
+    /// ========================================================
+    ///
+    /// 只在 parameter_version 变化时调用。
+    ///
+    /// exp / powf 的计算因此不是每 Sample 执行。
+    #[inline]
+    fn apply_runtime_params(
+        &mut self,
+        params: LimiterParams,
+    ) {
+        let params =
+            params.sanitized();
+
+        self.current_params =
+            params;
+
+        // RMS Threshold
+        self.threshold_db =
+            params.threshold_db;
+
+        // RMS Attack
+        self.attack_coeff =
+            Self::calc_coeff(
+                params.attack_ms,
+                self.sample_rate,
+            );
+
+        // RMS Release
+        self.release_coeff =
+            Self::calc_coeff(
+                params.release_ms,
+                self.sample_rate,
+            );
+
+        // Peak Release
+        self.peak_release_coeff =
+            Self::calc_coeff(
+                params
+                    .peak_release_ms,
+                self.sample_rate,
+            );
+
+        // Pre-Gain 只改变 Target。
+        //
+        // 实际 pre_gain_smoother
+        // 会继续按 20ms 平滑过去，
+        // 防止滑块变化产生 click。
+        self.pre_gain_target_linear =
+            Self::db_to_linear(
+                params.pre_gain_db,
+            );
     }
 
     /// ========================================================
     /// 设置真实采样率
     /// ========================================================
-
-    pub fn set_sample_rate(&mut self, sr: f32) {
-        if !sr.is_finite() || sr < 8000.0 {
+    ///
+    /// 这里彻底不访问 Config。
+    ///
+    /// 所有用户参数都从 current_params 重算。
+    pub fn set_sample_rate(
+        &mut self,
+        sr: f32,
+    ) {
+        if !sr.is_finite()
+            || sr < 8000.0
+        {
             return;
         }
 
         self.sample_rate = sr;
 
-        // RMS UI 参数
-        if let Ok(cfg) = self.config.try_lock() {
-            self.attack_coeff =
-                Self::calc_coeff(
-                    cfg.attack_ms,
-                    sr,
-                );
+        // ====================================================
+        // 用户可调 RMS 参数
+        // ====================================================
 
-            self.release_coeff =
-                Self::calc_coeff(
-                    cfg.release_ms,
-                    sr,
-                );
-        }
+        self.threshold_db =
+            self
+                .current_params
+                .threshold_db;
 
-        // RMS detector
+        self.attack_coeff =
+            Self::calc_coeff(
+                self
+                    .current_params
+                    .attack_ms,
+                sr,
+            );
+
+        self.release_coeff =
+            Self::calc_coeff(
+                self
+                    .current_params
+                    .release_ms,
+                sr,
+            );
+
+        // ====================================================
+        // Pre-Gain
+        // ====================================================
+
+        self.pre_gain_target_linear =
+            Self::db_to_linear(
+                self
+                    .current_params
+                    .pre_gain_db,
+            );
+
+        self.pre_gain_smooth_coeff =
+            Self::calc_coeff(
+                PRE_GAIN_SMOOTH_MS,
+                sr,
+            );
+
+        // 注意：
+        //
+        // 不把 pre_gain_smoother
+        // 强行跳到 target。
+        //
+        // 保留当前值，
+        // 避免采样率变化时额外产生 Gain Jump。
+
+        // ====================================================
+        // 固定 RMS Detector
+        // ====================================================
+
         self.rms_detector_coeff =
             Self::calc_coeff(
                 RMS_DETECTOR_MS,
                 sr,
             );
 
+        // ====================================================
         // Peak
+        // ====================================================
+
         self.peak_attack_coeff =
             Self::calc_coeff(
                 PEAK_ATTACK_MS,
@@ -502,42 +605,26 @@ impl LoudnessLimiter {
 
         self.peak_release_coeff =
             Self::calc_coeff(
-                PEAK_RELEASE_MS,
+                self
+                    .current_params
+                    .peak_release_ms,
                 sr,
             );
 
-        // Detail
-        self.detail_enable_coeff =
-            Self::calc_coeff(
-                DETAIL_ENABLE_MS,
-                sr,
-            );
-
-        self.detail_disable_coeff =
-            Self::calc_coeff(
-                DETAIL_DISABLE_MS,
-                sr,
-            );
-
-        // EQ
-        self.footstep_eq_l.set_peaking(
-            sr,
-            FOOTSTEP_EQ_FREQ_HZ,
-            FOOTSTEP_EQ_Q,
-            FOOTSTEP_EQ_GAIN_DB,
-        );
-
-        self.footstep_eq_r.set_peaking(
-            sr,
-            FOOTSTEP_EQ_FREQ_HZ,
-            FOOTSTEP_EQ_Q,
-            FOOTSTEP_EQ_GAIN_DB,
-        );
-
-        self.footstep_eq_l.reset();
-        self.footstep_eq_r.reset();
-
+        // ====================================================
         // Lookahead
+        // ====================================================
+        //
+        // 当前仍然维持原来的行为：
+        //
+        // SR 改变时重建 Lookahead Buffer。
+        //
+        // 如果未来支持运行中热切换采样率，
+        // 这里会产生约一个 Lookahead 窗口的空数据。
+        //
+        // 这是已知的未来优化项，
+        // 本轮不扩大修改范围。
+
         self.lookahead_samples =
             Self::calc_lookahead_samples(
                 LOOKAHEAD_MS,
@@ -545,198 +632,146 @@ impl LoudnessLimiter {
             );
 
         self.lookahead_l =
-            vec![0.0; self.lookahead_samples];
+            vec![
+                0.0;
+                self.lookahead_samples
+            ];
 
         self.lookahead_r =
-            vec![0.0; self.lookahead_samples];
+            vec![
+                0.0;
+                self.lookahead_samples
+            ];
 
         self.lookahead_pos = 0;
 
+        // Lookahead 被清空以后，
+        // Peak Hold 状态也必须同步清空。
         self.peak_hold_gain = 1.0;
         self.peak_hold_counter = 0;
+        self.peak_hold_active = false;
     }
 
     /// ========================================================
-    /// 同步 UI 参数
-    /// ========================================================
-
-    pub fn update_parameters(&mut self) {
-        if let Ok(cfg) = self.config.try_lock() {
-            self.threshold_db =
-                cfg.threshold_db;
-
-            self.threshold_linear =
-                Self::db_to_linear(
-                    cfg.threshold_db,
-                );
-
-            self.attack_coeff =
-                Self::calc_coeff(
-                    cfg.attack_ms,
-                    self.sample_rate,
-                );
-
-            self.release_coeff =
-                Self::calc_coeff(
-                    cfg.release_ms,
-                    self.sample_rate,
-                );
-        }
-    }
-
-    /// ========================================================
-    /// 处理一组 Stereo Frame
+    /// 处理一个 Stereo Frame
     /// ========================================================
     ///
-    /// 必须：
+    /// 重要：
     ///
-    /// left  = 当前帧左声道
-    /// right = 当前帧右声道
+    /// 这个函数本身不检查参数版本。
     ///
-    /// 左右声道：
-    /// - 分别做 EQ
-    /// - 但是共用 RMS / Peak Detector
-    /// - 共用最终 Gain
+    /// 原因：
     ///
-    /// 这样不会因为单边枪声导致左右声道压缩程度不同，
-    /// 从而破坏 PUBG 方位感。
+    /// 48kHz 下每秒调用约 48,000 次，
+    /// 没必要每 Sample Atomic load。
+    ///
+    /// audio/mod.rs 必须在每个 callback 开始调用：
+    ///
+    /// begin_audio_callback()
+    ///
+    /// 然后再处理本 callback 的全部 frame。
     #[inline]
     pub fn process_stereo_frame(
         &mut self,
         left: f32,
         right: f32,
     ) -> (f32, f32) {
-        // ========================================================
-        // 1. 检测原始声音大小
-        // ========================================================
+        // ====================================================
+        // Diagnostics
+        // ====================================================
 
-        let raw_energy =
-            (left * left + right * right) * 0.5;
+        self.diagnostic_processed_frames += 1;
 
-        self.detail_rms =
-            raw_energy
-                * (1.0 - self.rms_detector_coeff)
-                + self.detail_rms
-                    * self.rms_detector_coeff;
+        // ====================================================
+        // 1. 输入异常保护
+        // ====================================================
 
-        let raw_rms =
-            self.detail_rms.sqrt();
-
-        let raw_db =
-            Self::linear_to_db(raw_rms);
-// 检测瞬时 Peak。
-// RMS 对非常短的换弹声、金属点击声反应比较慢，
-// 所以额外用 Peak 防止这些声音被脚步增强放大。
-let raw_peak =
-    left.abs().max(right.abs());
-
-let raw_peak_db =
-    Self::linear_to_db(raw_peak);
-        // ========================================================
-        // 2. 动态脚步增强 Amount
-        // ========================================================
-
-        let detail_target =
-            Self::calc_detail_amount(raw_db);
-
-        // 小声音出现：
-        // 慢一点把细节增强打开。
-        //
-        // 突然来枪声：
-        // 快速关闭增强。
-        let detail_coeff =
-            if detail_target
-                > self.detail_amount_smoother
-            {
-                self.detail_enable_coeff
+        let left =
+            if left.is_finite() {
+                left
             } else {
-                self.detail_disable_coeff
+                0.0
             };
 
-        self.detail_amount_smoother =
-            detail_target
-                * (1.0 - detail_coeff)
-                + self.detail_amount_smoother
-                    * detail_coeff;
+        let right =
+            if right.is_finite() {
+                right
+            } else {
+                0.0
+            };
 
-        self.detail_amount_smoother =
-            self.detail_amount_smoother
-                .clamp(0.0, 1.0);
+        // ====================================================
+        // 2. Pre-Gain 平滑
+        // ====================================================
 
-       let peak_guard =
-    Self::calc_detail_peak_guard(raw_peak_db);
+        self.pre_gain_smoother =
+            self
+                .pre_gain_target_linear
+                * (
+                    1.0
+                        - self
+                            .pre_gain_smooth_coeff
+                )
+                + self
+                    .pre_gain_smoother
+                    * self
+                        .pre_gain_smooth_coeff;
 
-let detail_amount =
-    self.detail_amount_smoother
-        * peak_guard;
-
-        // ========================================================
-        // 3. 动态 Presence EQ
-        // ========================================================
-
-        // EQ 始终运行，保证滤波器状态连续。
-        //
-        // 但只根据 detail_amount
-        // 混入一部分 EQ 后的信号。
-        let eq_left =
-            self.footstep_eq_l.process(left);
-
-        let eq_right =
-            self.footstep_eq_r.process(right);
-
-        let mut enhanced_left =
+        let boosted_left =
             left
-                + (eq_left - left)
-                    * detail_amount;
+                * self
+                    .pre_gain_smoother;
 
-        let mut enhanced_right =
+        let boosted_right =
             right
-                + (eq_right - right)
-                    * detail_amount;
+                * self
+                    .pre_gain_smoother;
 
-        // ========================================================
-        // 4. 轻度 Upward Compression
-        // ========================================================
-
-        // 最大 +3 dB。
+        // ====================================================
+        // 3. Stereo Linked RMS Detector
+        // ====================================================
         //
-        // 只在较小声音时生效。
-        // 枪声一旦变大，detail_amount 会迅速下降。
-        let upward_gain_db =
-            FOOTSTEP_UPWARD_GAIN_DB
-                * detail_amount;
-
-        let upward_gain =
-            Self::db_to_linear(
-                upward_gain_db,
-            );
-
-        enhanced_left *= upward_gain;
-        enhanced_right *= upward_gain;
-
-        // ========================================================
-        // 5. Stereo Linked RMS Detector
-        // ========================================================
+        // 使用左右声道较大的 Energy。
+        //
+        // 防止单侧枪声因为 L/R 平均
+        // 被低估约 3dB。
 
         let energy =
-    (enhanced_left * enhanced_left)
-        .max(enhanced_right * enhanced_right);
+            (
+                boosted_left
+                    * boosted_left
+            )
+                .max(
+                    boosted_right
+                        * boosted_right,
+                );
 
         self.fullband_rms =
             energy
-                * (1.0 - self.rms_detector_coeff)
-                + self.fullband_rms
-                    * self.rms_detector_coeff;
+                * (
+                    1.0
+                        - self
+                            .rms_detector_coeff
+                )
+                + self
+                    .fullband_rms
+                    * self
+                        .rms_detector_coeff;
 
         let rms =
-            self.fullband_rms.sqrt();
+            self
+                .fullband_rms
+                .max(0.0)
+                .sqrt();
 
         let rms_db =
-            Self::linear_to_db(rms);
+            Self::linear_to_db(
+                rms,
+            );
 
-        // ========================================================
-        // 6. RMS Soft Knee Limiter
-        // ========================================================
+        // ====================================================
+        // 4. RMS Soft Knee Limiter
+        // ====================================================
 
         let rms_target_gain =
             Self::soft_knee_limiter_gain(
@@ -756,72 +791,99 @@ let detail_amount =
 
         self.gain_smoother =
             rms_target_gain
-                * (1.0 - rms_coeff)
-                + self.gain_smoother
+                * (
+                    1.0
+                        - rms_coeff
+                )
+                + self
+                    .gain_smoother
                     * rms_coeff;
 
         self.gain_smoother =
-            self.gain_smoother
-                .clamp(0.0, 1.0);
+            self
+                .gain_smoother
+                .clamp(
+                    0.0,
+                    1.0,
+                );
 
-        // ========================================================
-        // 7. Stereo Linked Peak Detector
-        // ========================================================
+        self.diagnostic_rms_gain_min =
+            self
+                .diagnostic_rms_gain_min
+                .min(
+                    self
+                        .gain_smoother,
+                );
 
-        // 左右声道谁的 Peak 更大，就以谁为准。
-        //
-        // 但最终左右使用同一个 Gain。
+        // ====================================================
+        // 5. Stereo Linked Peak Detector
+        // ====================================================
+
         let peak =
-            enhanced_left
+            boosted_left
                 .abs()
-                .max(enhanced_right.abs());
+                .max(
+                    boosted_right
+                        .abs(),
+                );
 
         let peak_target_gain =
             if peak <= 0.0 {
                 1.0
             } else {
                 (
-                    self.peak_threshold_linear
+                    self
+                        .peak_threshold_linear
                         / peak
                 )
                     .min(1.0)
             };
 
-        // ========================================================
-        // 8. Peak Hold
-        // ========================================================
+        // ====================================================
+        // 6. Peak Hold
+        // ====================================================
         //
-        // Lookahead 最大的问题是：
+        // Hold 期间保存最严格 Peak Gain。
         //
-        // 非常短的单个枪声 Peak
-        // 可能只持续几个 sample。
-        //
-        // 所以发现 Peak 后，
-        // 把它需要的 Gain 至少保持一个 Lookahead 窗口。
-        if peak_target_gain < 1.0 {
-    // Hold 期间只允许压得更多，
-    // 不允许后面的较小 Peak 提前把 Gain 放回来。
-    self.peak_hold_gain =
-        self.peak_hold_gain.min(peak_target_gain);
+        // 后续较小 Peak
+        // 不允许提前放松 Gain。
 
-    self.peak_hold_counter =
-        self.lookahead_samples;
-} else if self.peak_hold_counter > 0 {
-    self.peak_hold_counter -= 1;
-} else {
-    self.peak_hold_gain = 1.0;
-}
+        if peak_target_gain < 1.0 {
+            // 新的一次 Peak Event。
+            if !self.peak_hold_active {
+                self.diagnostic_peak_hold_events += 1;
+
+                self.peak_hold_active = true;
+            }
+
+            self.peak_hold_gain =
+                self
+                    .peak_hold_gain
+                    .min(
+                        peak_target_gain,
+                    );
+
+            self.peak_hold_counter =
+                self.lookahead_samples;
+        } else if self.peak_hold_counter > 0 {
+            self.peak_hold_counter -= 1;
+        } else {
+            self.peak_hold_gain = 1.0;
+
+            self.peak_hold_active = false;
+        }
 
         let peak_control_target =
             self.peak_hold_gain;
 
-        // ========================================================
-        // 9. Peak Attack / Release
-        // ========================================================
+        // ====================================================
+        // 7. Peak Attack / Release
+        // ====================================================
 
         let peak_coeff =
             if peak_control_target
-                < self.peak_gain_smoother
+                < self
+                    .peak_gain_smoother
             {
                 self.peak_attack_coeff
             } else {
@@ -830,31 +892,56 @@ let detail_amount =
 
         self.peak_gain_smoother =
             peak_control_target
-                * (1.0 - peak_coeff)
-                + self.peak_gain_smoother
+                * (
+                    1.0
+                        - peak_coeff
+                )
+                + self
+                    .peak_gain_smoother
                     * peak_coeff;
 
         self.peak_gain_smoother =
-            self.peak_gain_smoother
-                .clamp(0.0, 1.0);
+            self
+                .peak_gain_smoother
+                .clamp(
+                    0.0,
+                    1.0,
+                );
 
-        // ========================================================
-        // 10. RMS + Peak
-        // ========================================================
+        // ====================================================
+        // Peak Diagnostics
+        // ====================================================
+
+        if self.peak_gain_smoother
+            < LIMIT_ACTIVE_GAIN
+        {
+            self.diagnostic_peak_limit_frames += 1;
+        }
+
+        self.diagnostic_peak_gain_min =
+            self
+                .diagnostic_peak_gain_min
+                .min(
+                    self
+                        .peak_gain_smoother,
+                );
+
+        // ====================================================
+        // 8. RMS / Peak 取更严格的 Gain
+        // ====================================================
 
         let final_gain =
-            self.gain_smoother
-                .min(self.peak_gain_smoother);
+            self
+                .gain_smoother
+                .min(
+                    self
+                        .peak_gain_smoother,
+                );
 
-        // ========================================================
-        // 11. 5ms Lookahead
-        // ========================================================
-        //
-        // 当前声音先进入 detector，
-        // 但真正输出的是 5ms 以前的声音。
-        //
-        // 因此 Limiter 相当于提前 5ms
-        // “知道”枪声马上要输出。
+        // ====================================================
+        // 9. 5ms Lookahead
+        // ====================================================
+
         let delayed_left =
             self.lookahead_l[
                 self.lookahead_pos
@@ -867,69 +954,104 @@ let detail_amount =
 
         self.lookahead_l[
             self.lookahead_pos
-        ] = enhanced_left;
+        ] = boosted_left;
 
         self.lookahead_r[
             self.lookahead_pos
-        ] = enhanced_right;
+        ] = boosted_right;
 
         self.lookahead_pos += 1;
 
         if self.lookahead_pos
-            >= self.lookahead_samples
+            >= self
+                .lookahead_samples
         {
             self.lookahead_pos = 0;
         }
 
-        // ========================================================
-        // 12. 应用 Linked Gain
-        // ========================================================
+        // ====================================================
+        // 10. 应用 Linked Gain
+        // ====================================================
 
         let processed_left =
-            delayed_left * final_gain;
+            delayed_left
+                * final_gain;
 
         let processed_right =
-            delayed_right * final_gain;
+            delayed_right
+                * final_gain;
 
-        // ========================================================
-        // 13. 最终 Ceiling
-        // ========================================================
+        // ====================================================
+        // 11. Ceiling Diagnostics
+        // ====================================================
         //
-        // Lookahead 加入以后，
-        // 这里应该比旧版本少触发很多。
-        //
-        // 仍然保留作为最后保险。
+        // 一组 L/R 算一个 Stereo Frame。
+
+        if processed_left.abs()
+            > self
+                .peak_threshold_linear
+            || processed_right.abs()
+                > self
+                    .peak_threshold_linear
+        {
+            self.diagnostic_ceiling_hit_frames += 1;
+        }
+
+        // ====================================================
+        // 12. 最终 -3dBFS Ceiling
+        // ====================================================
+
         let output_left =
-            processed_left.clamp(
-                -self.peak_threshold_linear,
-                self.peak_threshold_linear,
-            );
+            processed_left
+                .clamp(
+                    -self
+                        .peak_threshold_linear,
+                    self
+                        .peak_threshold_linear,
+                );
 
         let output_right =
-            processed_right.clamp(
-                -self.peak_threshold_linear,
-                self.peak_threshold_linear,
-            );
+            processed_right
+                .clamp(
+                    -self
+                        .peak_threshold_linear,
+                    self
+                        .peak_threshold_linear,
+                );
 
-        (output_left, output_right)
+        // ====================================================
+        // Diagnostics 批量 Flush
+        // ====================================================
+
+        self.maybe_flush_diagnostics();
+
+        (
+            output_left,
+            output_right,
+        )
     }
 
     /// ========================================================
-    /// 处理 interleaved Stereo buffer
+    /// 处理 Interleaved Stereo Buffer
     /// ========================================================
     ///
-    /// 数据格式：
+    /// L R L R L R...
     ///
-    /// L R L R L R L R
-    ///
-    /// 如果你的 callback 正好拿到这种 &mut [f32]，
-    /// 可以直接调用这个函数。
+    /// 这里本身就是一个 Buffer 级接口，
+    /// 所以参数只在整个 Buffer 开始同步一次。
     pub fn process_interleaved_stereo(
         &mut self,
         data: &mut [f32],
     ) {
-        for frame in data.chunks_exact_mut(2) {
-            let (left, right) =
+        self.begin_audio_callback();
+
+        for frame in
+            data.chunks_exact_mut(2)
+        {
+            let (
+                left,
+                right,
+            ) =
                 self.process_stereo_frame(
                     frame[0],
                     frame[1],
@@ -944,17 +1066,22 @@ let detail_amount =
     /// Mono 兼容接口
     /// ========================================================
     ///
-    /// 注意：
+    /// PUBG Stereo 不应通过这个接口
+    /// 分别处理左右声道。
     ///
-    /// PUBG Stereo 音频不要再左右声道分别调用这个函数。
-    ///
-    /// Stereo 必须调用 process_stereo_frame()
-    /// 或 process_interleaved_stereo()。
+    /// 单独使用 Mono 接口时，
+    /// 没有外层 Buffer Hook，
+    /// 因此这里同步一次参数。
     pub fn process_sample(
         &mut self,
         sample: f32,
     ) -> f32 {
-        let (output, _) =
+        self.begin_audio_callback();
+
+        let (
+            output,
+            _,
+        ) =
             self.process_stereo_frame(
                 sample,
                 sample,
@@ -964,7 +1091,76 @@ let detail_amount =
     }
 
     /// ========================================================
-    /// Soft Knee Limiter Gain
+    /// Diagnostics：是否需要 Flush
+    /// ========================================================
+
+    #[inline]
+    fn maybe_flush_diagnostics(
+        &mut self,
+    ) {
+        if self
+            .diagnostic_processed_frames
+            >= DIAGNOSTIC_FLUSH_FRAMES
+        {
+            self.flush_diagnostics();
+        }
+    }
+
+    /// ========================================================
+    /// Diagnostics：批量提交
+    /// ========================================================
+
+    fn flush_diagnostics(
+        &mut self,
+    ) {
+        if self
+            .diagnostic_processed_frames
+            == 0
+        {
+            return;
+        }
+
+        crate::diagnostics::limiter_batch(
+            self
+                .diagnostic_processed_frames,
+
+            self
+                .diagnostic_ceiling_hit_frames,
+
+            self
+                .diagnostic_peak_limit_frames,
+
+            self
+                .diagnostic_peak_hold_events,
+
+            self
+                .diagnostic_peak_gain_min,
+
+            self
+                .diagnostic_rms_gain_min,
+        );
+
+        self.diagnostic_processed_frames =
+            0;
+
+        self.diagnostic_ceiling_hit_frames =
+            0;
+
+        self.diagnostic_peak_limit_frames =
+            0;
+
+        self.diagnostic_peak_hold_events =
+            0;
+
+        self.diagnostic_peak_gain_min =
+            1.0;
+
+        self.diagnostic_rms_gain_min =
+            1.0;
+    }
+
+    /// ========================================================
+    /// RMS Soft Knee Limiter Gain
     /// ========================================================
 
     #[inline]
@@ -977,13 +1173,17 @@ let detail_amount =
             return 1.0;
         }
 
+        // Hard Knee fallback。
         if knee_db <= 0.0 {
-            if level_db <= threshold_db {
+            if level_db
+                <= threshold_db
+            {
                 return 1.0;
             }
 
             return Self::db_to_linear(
-                threshold_db - level_db,
+                threshold_db
+                    - level_db,
             );
         }
 
@@ -991,114 +1191,46 @@ let detail_amount =
             knee_db * 0.5;
 
         let knee_start =
-            threshold_db - half_knee;
+            threshold_db
+                - half_knee;
 
         let knee_end =
-            threshold_db + half_knee;
+            threshold_db
+                + half_knee;
 
         let gain_db =
             if level_db <= knee_start {
                 0.0
-            } else if level_db >= knee_end {
-                threshold_db - level_db
+            } else if level_db
+                >= knee_end
+            {
+                threshold_db
+                    - level_db
             } else {
-                // 无限压缩比 Limiter 的
-                // 标准 quadratic soft knee。
                 let x =
-                    level_db - knee_start;
+                    level_db
+                        - knee_start;
 
                 -(x * x)
-                    / (2.0 * knee_db)
+                    / (
+                        2.0
+                            * knee_db
+                    )
             };
 
-        Self::db_to_linear(gain_db)
-            .clamp(0.0, 1.0)
+        Self::db_to_linear(
+            gain_db,
+        )
+        .clamp(
+            0.0,
+            1.0,
+        )
     }
 
     /// ========================================================
-    /// 根据当前响度计算脚步增强程度
+    /// Lookahead ms → Stereo Frame
     /// ========================================================
 
-    #[inline]
-    fn calc_detail_amount(
-        level_db: f32,
-    ) -> f32 {
-        if !level_db.is_finite() {
-            return 0.0;
-        }
-
-        // 极安静：
-        // 不增强，避免提高底噪。
-        if level_db <= DETAIL_MIN_DB {
-            return 0.0;
-        }
-
-        // -60 → -38 dB：
-        // 从 0 慢慢增加到最大。
-        if level_db < DETAIL_FULL_DB {
-            return (
-                (level_db - DETAIL_MIN_DB)
-                    / (
-                        DETAIL_FULL_DB
-                            - DETAIL_MIN_DB
-                    )
-            )
-                .clamp(0.0, 1.0);
-        }
-
-        // -38 → -20 dB：
-        // 从最大逐渐降低到 0。
-        if level_db < DETAIL_OFF_DB {
-            return (
-                (
-                    DETAIL_OFF_DB
-                        - level_db
-                )
-                    / (
-                        DETAIL_OFF_DB
-                            - DETAIL_FULL_DB
-                    )
-            )
-                .clamp(0.0, 1.0);
-        }
-
-        // 大声：
-        // 完全关闭脚步增强。
-        0.0
-    }
-
-    /// ========================================================
-    /// Lookahead frame 数
-    /// ========================================================
-#[inline]
-fn calc_detail_peak_guard(
-    peak_db: f32,
-) -> f32 {
-    if !peak_db.is_finite() {
-        return 0.0;
-    }
-
-    // 小 Peak：完全允许脚步增强
-    if peak_db <= DETAIL_PEAK_FULL_DB {
-        return 1.0;
-    }
-
-    // 大 Peak：完全禁止脚步增强
-    if peak_db >= DETAIL_PEAK_OFF_DB {
-        return 0.0;
-    }
-
-    // -24dB → -12dB
-    // 从 1.0 平滑下降到 0.0
-    (
-        (DETAIL_PEAK_OFF_DB - peak_db)
-            / (
-                DETAIL_PEAK_OFF_DB
-                    - DETAIL_PEAK_FULL_DB
-            )
-    )
-        .clamp(0.0, 1.0)
-}
     fn calc_lookahead_samples(
         time_ms: u32,
         sr: f32,
@@ -1106,16 +1238,18 @@ fn calc_detail_peak_guard(
         let samples =
             (
                 sr
-                    * time_ms as f32
+                    * time_ms
+                        as f32
                     / 1000.0
             )
-                .round() as usize;
+                .round()
+                as usize;
 
         samples.max(1)
     }
 
     /// ========================================================
-    /// 时间常数 → 一阶滤波系数
+    /// 时间常数 → 一阶指数系数
     /// ========================================================
 
     fn calc_coeff(
@@ -1132,11 +1266,18 @@ fn calc_detail_peak_guard(
         if samples <= 0.0 {
             0.0
         } else {
-            (-1.0 / samples).exp()
+            (
+                -1.0
+                    / samples
+            )
+                .exp()
         }
     }
 
-    /// dB → linear
+    /// ========================================================
+    /// dB → Linear
+    /// ========================================================
+
     #[inline]
     fn db_to_linear(
         db: f32,
@@ -1146,15 +1287,31 @@ fn calc_detail_peak_guard(
         )
     }
 
-    /// linear → dB
+    /// ========================================================
+    /// Linear → dB
+    /// ========================================================
+
     #[inline]
     fn linear_to_db(
         value: f32,
     ) -> f32 {
-        if value <= 0.000001 {
+        if value
+            <= 0.000001
+        {
             -120.0
         } else {
-            20.0 * value.log10()
+            20.0
+                * value.log10()
         }
+    }
+}
+
+/// ============================================================
+/// Limiter 被销毁前提交最后不足 4096 Frame 的 Diagnostics
+/// ============================================================
+
+impl Drop for LoudnessLimiter {
+    fn drop(&mut self) {
+        self.flush_diagnostics();
     }
 }
