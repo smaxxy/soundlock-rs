@@ -37,6 +37,12 @@ pub struct Diagnostics {
     /// Output Callback 发现 Ring 空的 callback 次数。
     pub output_underruns: AtomicU64,
 
+    /// Ring 漂移补偿计数 / 阈值，单位 Stereo Frame。
+    pub ring_drift_low_corrections: AtomicU64,
+    pub ring_drift_high_corrections: AtomicU64,
+    pub ring_drift_low_watermark_frames: AtomicU64,
+    pub ring_drift_high_watermark_frames: AtomicU64,
+
     // Audio Supervisor lifetime
     pub audio_session_starts: AtomicU64,
     pub audio_reconnect_attempts: AtomicU64,
@@ -84,6 +90,10 @@ impl Default for Diagnostics {
             limiter_lock_misses: AtomicU64::new(0),
             ring_push_drops: AtomicU64::new(0),
             output_underruns: AtomicU64::new(0),
+            ring_drift_low_corrections: AtomicU64::new(0),
+            ring_drift_high_corrections: AtomicU64::new(0),
+            ring_drift_low_watermark_frames: AtomicU64::new(0),
+            ring_drift_high_watermark_frames: AtomicU64::new(0),
 
             audio_session_starts: AtomicU64::new(0),
             audio_reconnect_attempts: AtomicU64::new(0),
@@ -227,6 +237,14 @@ fn build_log_line(diagnostics: &Diagnostics) -> String {
     let ring_capacity_frames = diagnostics.ring_capacity_frames.load(Ordering::Relaxed);
     let ring_target_frames = diagnostics.ring_target_frames.load(Ordering::Relaxed);
     let ring_fill_current = diagnostics.ring_fill_current_frames.load(Ordering::Relaxed);
+    let ring_drift_low_corr =
+        diagnostics.ring_drift_low_corrections.load(Ordering::Relaxed);
+    let ring_drift_high_corr =
+        diagnostics.ring_drift_high_corrections.load(Ordering::Relaxed);
+    let ring_drift_low_wm =
+        diagnostics.ring_drift_low_watermark_frames.load(Ordering::Relaxed);
+    let ring_drift_high_wm =
+        diagnostics.ring_drift_high_watermark_frames.load(Ordering::Relaxed);
 
     let ring_fill_min_raw = diagnostics
         .ring_fill_window_min_frames
@@ -287,6 +305,7 @@ fn build_log_line(diagnostics: &Diagnostics) -> String {
         "[{}] \
 ui_ticks={} input_callbacks={} output_callbacks={} input_errors={} output_errors={} \
 limiter_lock_misses={} ring_push_drops={} output_underruns={} \
+ring_drift_low_corr={} ring_drift_high_corr={} ring_drift_low_wm={} ring_drift_high_wm={} \
 audio_session_starts={} audio_reconnect_attempts={} sample_rate_hz={} \
 processed_frames={} ceiling_hit_frames={} peak_limit_frames={} rms_limit_frames={} peak_hold_events={} \
 peak_gain_min_db={:.3} rms_gain_min_db={:.3} \
@@ -304,6 +323,10 @@ ring_fill_current_ms={:.2} limiter_lookahead_ms={:.2} software_latency_est_ms={:
         diagnostics.limiter_lock_misses.load(Ordering::Relaxed),
         diagnostics.ring_push_drops.load(Ordering::Relaxed),
         diagnostics.output_underruns.load(Ordering::Relaxed),
+        ring_drift_low_corr,
+        ring_drift_high_corr,
+        ring_drift_low_wm,
+        ring_drift_high_wm,
         diagnostics.audio_session_starts.load(Ordering::Relaxed),
         diagnostics.audio_reconnect_attempts.load(Ordering::Relaxed),
         sample_rate_hz,
@@ -354,6 +377,8 @@ pub fn reset_limiter_stats() {
 
     d.audio_session_starts.store(0, Ordering::Relaxed);
     d.audio_reconnect_attempts.store(0, Ordering::Relaxed);
+    d.ring_drift_low_corrections.store(0, Ordering::Relaxed);
+    d.ring_drift_high_corrections.store(0, Ordering::Relaxed);
 
     reset_limiter_window(d);
 }
@@ -423,6 +448,17 @@ pub fn configure_ring_monitor(target_frames: usize, capacity_frames: usize) {
     d.ring_fill_window_samples.store(0, Ordering::Relaxed);
 }
 
+pub fn configure_ring_drift_monitor(
+    low_watermark_frames: usize,
+    high_watermark_frames: usize,
+) {
+    let d = global();
+    d.ring_drift_low_watermark_frames
+        .store(low_watermark_frames as u64, Ordering::Relaxed);
+    d.ring_drift_high_watermark_frames
+        .store(high_watermark_frames as u64, Ordering::Relaxed);
+}
+
 #[inline]
 pub fn ring_fill_sample(fill_frames: usize) {
     let d = global();
@@ -484,6 +520,20 @@ pub fn ring_push_drop() {
 pub fn output_underrun() {
     global()
         .output_underruns
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn ring_drift_low_correction() {
+    global()
+        .ring_drift_low_corrections
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn ring_drift_high_correction() {
+    global()
+        .ring_drift_high_corrections
         .fetch_add(1, Ordering::Relaxed);
 }
 
