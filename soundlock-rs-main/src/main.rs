@@ -81,6 +81,25 @@ unsafe extern "system" fn tray_wnd_proc(
 
     match msg {
         WM_TRAYICON => {
+            // 左键点击托盘图标：
+            // 请求重新打开 UI，并结束当前托盘消息循环。
+            if lparam.0 as u32 == WM_LBUTTONUP {
+                tray_state::SHOULD_SHOW_UI.store(
+                    true,
+                    Ordering::SeqCst,
+                );
+
+                // 这里只结束当前主线程中的托盘消息循环。
+                //
+                // WM_QUIT 会被下面的 GetMessageW 消费掉，
+                // 不会在队列里额外残留。
+                PostQuitMessage(0);
+
+                return LRESULT(0);
+            }
+
+            // 右键点击托盘图标：
+            // 保持原来的“退出”菜单。
             if lparam.0 as u32 == WM_RBUTTONUP {
                 let mut cursor_pos =
                     Default::default();
@@ -138,6 +157,8 @@ unsafe extern "system" fn tray_wnd_proc(
                     & 0xFFFF;
 
             if cmd == IDM_EXIT {
+                // 只有用户真正点击“退出”，
+                // 才通知整个程序退出。
                 tray_state::SHOULD_EXIT.store(
                     true,
                     Ordering::SeqCst,
@@ -150,15 +171,10 @@ unsafe extern "system" fn tray_wnd_proc(
         }
 
         WM_DESTROY => {
-            // 如果托盘窗口由于任何原因被销毁，
-            // 同样通知音频后台线程退出。
-            tray_state::SHOULD_EXIT.store(
-                true,
-                Ordering::SeqCst,
-            );
-
-            PostQuitMessage(0);
-
+            // 这里只表示托盘隐藏窗口被销毁。
+            //
+            // 不设置 SHOULD_EXIT，也不要再次 PostQuitMessage。
+            // 左键重新打开 UI 时同样会销毁这个窗口。
             return LRESULT(0);
         }
 
@@ -173,7 +189,23 @@ unsafe extern "system" fn tray_wnd_proc(
     )
 }
 
-fn run_tray_loop() {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayAction {
+    ShowUi,
+    Exit,
+    Failed,
+}
+
+fn run_tray_loop() -> TrayAction {
+    use std::sync::atomic::Ordering;
+
+    // 每次进入托盘前只清掉“重新打开 UI”请求。
+    // SHOULD_EXIT 绝不能在这里清零。
+    tray_state::SHOULD_SHOW_UI.store(
+        false,
+        Ordering::SeqCst,
+    );
+
     unsafe {
         let hinstance =
             match GetModuleHandleW(None) {
@@ -184,17 +216,21 @@ fn run_tray_loop() {
                         "GetModuleHandleW failed: {}",
                         e
                     );
-                    return;
+                    return TrayAction::Failed;
                 }
             };
 
         let class_name =
             w!("SoundLockTrayWindow");
 
+        // app.rc:
+        // 1 ICON "assets/icon.ico"
+        //
+        // 这里继续使用你已经验证生效的 EXE 图标资源 #1。
         let icon =
             match LoadIconW(
-                None,
-                IDI_APPLICATION,
+                Some(hinstance.into()),
+                PCWSTR(1 as *const u16),
             ) {
                 Ok(icon) => icon,
 
@@ -203,7 +239,7 @@ fn run_tray_loop() {
                         "Failed to load tray icon: {}",
                         e
                     );
-                    return;
+                    return TrayAction::Failed;
                 }
             };
 
@@ -219,7 +255,7 @@ fn run_tray_loop() {
                         "Failed to load tray cursor: {}",
                         e
                     );
-                    return;
+                    return TrayAction::Failed;
                 }
             };
 
@@ -264,7 +300,7 @@ fn run_tray_loop() {
             log::error!(
                 "RegisterClassExW failed"
             );
-            return;
+            return TrayAction::Failed;
         }
 
         let hwnd =
@@ -291,7 +327,14 @@ fn run_tray_loop() {
                         "CreateWindowExW failed: {}",
                         e
                     );
-                    return;
+
+                    UnregisterClassW(
+                        class_name,
+                        Some(hinstance.into()),
+                    )
+                    .ok();
+
+                    return TrayAction::Failed;
                 }
             };
 
@@ -321,8 +364,6 @@ fn run_tray_loop() {
                         [u16; 128] =
                         [0; 128];
 
-                    // 数组本身已经补 0，
-                    // 不需要在字符串里额外放 '\0'。
                     let text =
                         "Sound Lock";
 
@@ -354,11 +395,15 @@ fn run_tray_loop() {
                 "Failed to add tray icon"
             );
 
-            // 没有托盘图标时继续进入消息循环，
-            // 用户将没有正常退出入口。
-            // 因此这里直接结束托盘阶段。
             DestroyWindow(hwnd).ok();
-            return;
+
+            UnregisterClassW(
+                class_name,
+                Some(hinstance.into()),
+            )
+            .ok();
+
+            return TrayAction::Failed;
         }
 
         let mut msg =
@@ -367,12 +412,9 @@ fn run_tray_loop() {
         loop {
             // GetMessageW:
             //
-            // > 0 : 收到普通消息
+            // > 0 : 普通消息
             // = 0 : 收到 WM_QUIT
             // < 0 : 调用失败
-            //
-            // 不能直接 .as_bool()，
-            // 否则 -1 也会被当成 true。
             let result =
                 GetMessageW(
                     &mut msg,
@@ -385,19 +427,8 @@ fn run_tray_loop() {
             if result > 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
-
-                if tray_state::
-                    SHOULD_EXIT
-                    .load(
-                        std::sync::
-                            atomic::
-                            Ordering::
-                            SeqCst,
-                    )
-                {
-                    break;
-                }
             } else if result == 0 {
+                // WM_QUIT 已在这里被消费。
                 break;
             } else {
                 log::error!(
@@ -407,6 +438,8 @@ fn run_tray_loop() {
             }
         }
 
+        // 离开托盘模式：
+        // 先删除托盘图标，再销毁隐藏窗口，最后注销窗口类。
         Shell_NotifyIconW(
             NIM_DELETE,
             &mut nid,
@@ -414,6 +447,31 @@ fn run_tray_loop() {
         .ok();
 
         DestroyWindow(hwnd).ok();
+
+        if let Err(e) =
+            UnregisterClassW(
+                class_name,
+                Some(hinstance.into()),
+            )
+        {
+            log::warn!(
+                "UnregisterClassW failed: {}",
+                e
+            );
+        }
+    }
+
+    if tray_state::SHOULD_EXIT.load(
+        Ordering::SeqCst,
+    ) {
+        TrayAction::Exit
+    } else if tray_state::SHOULD_SHOW_UI.swap(
+        false,
+        Ordering::SeqCst,
+    ) {
+        TrayAction::ShowUi
+    } else {
+        TrayAction::Failed
     }
 }
 
@@ -556,45 +614,22 @@ fn main() -> Result<(), ()> {
         icon_rgba
             .dimensions();
 
-    let icon_data =
-        icon_rgba
-            .into_raw();
+    // UI 可能反复创建：
+    // IconData 只构造一次，每次 NativeOptions 只 clone Arc。
+    let window_icon =
+        Arc::new(
+            IconData {
+                rgba:
+                    icon_rgba
+                        .into_raw(),
 
-    let native_options =
-        eframe::NativeOptions {
-            viewport:
-                egui::
-                    ViewportBuilder::
-                    default()
-                    .with_inner_size(
-                        [
-                            400.0,
-                            550.0,
-                        ],
-                    )
-                    .with_min_inner_size(
-                        [
-                            300.0,
-                            400.0,
-                        ],
-                    )
-                    .with_icon(
-                        Arc::new(
-                            IconData {
-                                rgba:
-                                    icon_data,
+                width:
+                    icon_width,
 
-                                width:
-                                    icon_width,
-
-                                height:
-                                    icon_height,
-                            },
-                        ),
-                    ),
-
-            ..Default::default()
-        };
+                height:
+                    icon_height,
+            },
+        );
 
     // ========================================================
     // App State
@@ -674,78 +709,167 @@ fn main() -> Result<(), ()> {
         start_crosshair();
 
     // ========================================================
-    // UI
+    // UI / Tray 生命周期
     // ========================================================
     //
-    // 注意：
+    // 核心原则：
     //
-    // main 不直接启动 audio::start_limiter()。
-    //
-    // 音频仍由 UI 中的“启动声音锁”逻辑创建，
-    // 避免重复创建 Input / Output Stream。
-    //
-    // 这里只把唯一的 runtime_params
-    // 传给 SettingsWindow。
-    let run_result =
-        eframe::run_native(
-            "Sound Lock Rust",
-            native_options,
+    // - eframe UI 和 Win32 Tray 都继续使用主线程；
+    // - 绝不 spawn + join 托盘线程；
+    // - 点 X 后 run_native 返回，UI 资源释放；
+    // - 然后进入托盘消息循环；
+    // - 左键托盘让 run_tray_loop() 返回 ShowUi；
+    // - 回到 loop 顶部重新创建一个新的 eframe UI；
+    // - Audio / Limiter / Ring / RuntimeLimiterParams 不重建。
 
-            Box::new(
-                move |_| {
-                    Ok(
-                        Box::new(
-                            SettingsWindow::new(
-                                Arc::clone(
-                                    &app_state,
-                                ),
-
-                                Arc::clone(
-                                    &config,
-                                ),
-
-                                Arc::clone(
-                                    &runtime_params,
-                                ),
+    loop {
+        // 每次重新打开 UI，都重新创建 NativeOptions。
+        let native_options =
+            eframe::NativeOptions {
+                viewport:
+                    egui::
+                        ViewportBuilder::
+                        default()
+                        .with_inner_size(
+                            [
+                                400.0,
+                                550.0,
+                            ],
+                        )
+                        .with_min_inner_size(
+                            [
+                                300.0,
+                                400.0,
+                            ],
+                        )
+                        .with_icon(
+                            Arc::clone(
+                                &window_icon,
                             ),
                         ),
-                    )
-                },
-            ),
-        );
 
-    if let Err(e) = run_result {
-        log::error!(
-            "无法创建或运行窗口: {}",
-            e
-        );
+                // 明确要求关闭窗口后返回 main。
+                run_and_return:
+                    true,
 
-        tray_state::SHOULD_EXIT
-            .store(
-                true,
+                ..Default::default()
+            };
+
+        // move 闭包只拿本轮 UI 的 Arc clone。
+        let ui_app_state =
+            Arc::clone(
+                &app_state,
+            );
+
+        let ui_config =
+            Arc::clone(
+                &config,
+            );
+
+        let ui_runtime_params =
+            Arc::clone(
+                &runtime_params,
+            );
+
+        let run_result =
+            eframe::run_native(
+                "Sound Lock Rust",
+                native_options,
+
+                Box::new(
+                    move |_| {
+                        Ok(
+                            Box::new(
+                                SettingsWindow::new(
+                                    Arc::clone(
+                                        &ui_app_state,
+                                    ),
+
+                                    Arc::clone(
+                                        &ui_config,
+                                    ),
+
+                                    Arc::clone(
+                                        &ui_runtime_params,
+                                    ),
+                                ),
+                            ),
+                        )
+                    },
+                ),
+            );
+
+        if let Err(e) =
+            run_result
+        {
+            log::error!(
+                "无法创建或运行窗口: {}",
+                e
+            );
+
+            tray_state::SHOULD_EXIT
+                .store(
+                    true,
+                    std::sync::
+                        atomic::
+                        Ordering::SeqCst,
+                );
+
+            break;
+        }
+
+        if tray_state::SHOULD_EXIT
+            .load(
                 std::sync::
                     atomic::
                     Ordering::SeqCst,
-            );
+            )
+        {
+            break;
+        }
 
-        return Err(());
+        // ====================================================
+        // UI 已关闭 -> 托盘模式
+        // ====================================================
+
+        log::info!(
+            "UI 已关闭，进入系统托盘，限幅继续运行"
+        );
+
+        let tray_action =
+            run_tray_loop();
+
+        match tray_action {
+            TrayAction::ShowUi => {
+                log::info!(
+                    "托盘左键点击，重新创建 UI"
+                );
+
+                // 继续下一轮，在同一个主线程重新 run_native。
+                continue;
+            }
+
+            TrayAction::Exit => {
+                break;
+            }
+
+            TrayAction::Failed => {
+                log::error!(
+                    "托盘阶段异常结束；为避免留下无 UI、无托盘的后台进程，程序将安全退出"
+                );
+
+                tray_state::SHOULD_EXIT
+                    .store(
+                        true,
+                        std::sync::
+                            atomic::
+                            Ordering::SeqCst,
+                    );
+
+                break;
+            }
+        }
     }
-
-    // ========================================================
-    // UI 已关闭
-    // ========================================================
-    //
-    // UI 被释放后：
-    //
-    // - eframe / egui 内存释放
-    // - 如果声音锁已经启动，Audio Thread 继续运行
-    // - 准星后台线程继续运行
-    // - 托盘负责最终退出
-    log::info!(
-        "UI 已关闭，启动系统托盘，限幅继续运行"
-    );
-
-    run_tray_loop();
 
     // ========================================================
     // 最终退出
