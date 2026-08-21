@@ -750,19 +750,18 @@ fn main() -> Result<(), ()> {
     // ========================================================
     // 最终退出
     // ========================================================
-    //
-    // 当前 audio::start_limiter() 没有返回 JoinHandle，
-    // 所以这里只能给音频控制线程一点退出时间。
-    //
-    // 后面做 Audio Supervisor 时再改成正式 join。
-    std::thread::sleep(
-        std::time::Duration::
-            from_millis(500),
+    // 无论托盘是正常退出还是创建失败返回，都明确通知后台线程结束。
+    tray_state::SHOULD_EXIT.store(
+        true,
+        std::sync::atomic::Ordering::SeqCst,
     );
 
-    log::info!(
-        "程序退出"
-    );
+    // Audio Supervisor 最长每 50ms 检查一次退出条件；
+    // 这里等待所有已启动的 Supervisor 自己释放 Stream / Ring / Limiter。
+    if !audio::wait_for_shutdown(std::time::Duration::from_secs(3)) {
+        log::warn!("等待音频线程退出超时，主程序将继续结束");
+    }
 
+    log::info!("程序退出");
     Ok(())
 }

@@ -3,583 +3,588 @@ pub mod limiter;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
 
-pub use limiter::LoudnessLimiter;
+pub use limiter::{LoudnessLimiter, LOOKAHEAD_MS};
 
-use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
 
 use crate::config::{Config, RuntimeLimiterParams};
 use crate::AppState;
 
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const TARGET_RING_LATENCY_MS: f32 = 150.0;
+const RECONNECT_FADE_MS: f32 = 10.0;
+const CONTROL_POLL: Duration = Duration::from_millis(50);
+const RECONNECT_BACKOFF_MIN_MS: u64 = 250;
+const RECONNECT_BACKOFF_MAX_MS: u64 = 2000;
+
+/// 每次用户点击“启动”都会生成新 generation。
+/// 旧 Supervisor 看到 generation 不匹配后会退出，避免快速停止/重启产生双 Stream。
+static AUDIO_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_AUDIO_THREADS: AtomicU64 = AtomicU64::new(0);
+
+/// 只串行化 Supervisor / Stream 生命周期，不进入任何实时 callback。
+/// 保证快速“停止 -> 启动”时旧 Stream 完整销毁后才创建新 Stream。
+static AUDIO_SESSION_LOCK: Mutex<()> = Mutex::new(());
+
+struct AudioThreadGuard;
+
+impl Drop for AudioThreadGuard {
+    fn drop(&mut self) {
+        ACTIVE_AUDIO_THREADS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Supervisor 结束时只有在自己仍是“当前 generation”时才恢复 UI 状态。
+/// 这样旧线程退出不会把刚启动的新 Session 的 is_limiting 错误清成 false。
+struct LimitingStateGuard {
+    state: Arc<Mutex<AppState>>,
+    generation: u64,
+}
+
+impl LimitingStateGuard {
+    fn new(state: Arc<Mutex<AppState>>, generation: u64) -> Self {
+        Self { state, generation }
+    }
+}
+
+impl Drop for LimitingStateGuard {
+    fn drop(&mut self) {
+        if AUDIO_GENERATION.load(Ordering::Acquire) == self.generation {
+            set_limiting_state(&self.state, false);
+        }
+    }
+}
+
+/// 每个 Audio Session 结束时清掉 Ring/延迟监控，避免日志保留旧 Session 水位。
+struct SessionMonitorGuard {
+    generation: u64,
+}
+
+impl SessionMonitorGuard {
+    fn new(generation: u64) -> Self {
+        Self { generation }
+    }
+}
+
+impl Drop for SessionMonitorGuard {
+    fn drop(&mut self) {
+        // 快速重启时，旧 generation 不能把新 Session 的监控清零。
+        if AUDIO_GENERATION.load(Ordering::Acquire) == self.generation {
+            crate::diagnostics::configure_ring_monitor(0, 0);
+            crate::diagnostics::configure_audio_monitor(0.0, 0.0);
+        }
+    }
+}
+
+enum SessionExit {
+    StopRequested,
+    Retry {
+        reason: String,
+        ran_for: Duration,
+    },
+}
+
+/// 普通控制线程使用；不是实时 Audio Callback，可以正常阻塞等待 Mutex。
+fn set_limiting_state(state: &Arc<Mutex<AppState>>, value: bool) {
+    match state.lock() {
+        Ok(mut state) => state.is_limiting = value,
+        Err(poisoned) => {
+            log::warn!("AppState mutex poisoned; recovering state");
+            poisoned.into_inner().is_limiting = value;
+        }
+    }
+}
+
+fn is_requested_to_run(state: &Arc<Mutex<AppState>>, generation: u64) -> bool {
+    if crate::tray_state::SHOULD_EXIT.load(Ordering::Acquire) {
+        return false;
+    }
+
+    if AUDIO_GENERATION.load(Ordering::Acquire) != generation {
+        return false;
+    }
+
+    match state.lock() {
+        Ok(state) => state.is_limiting,
+        Err(poisoned) => {
+            log::warn!("AppState mutex poisoned; recovering value");
+            poisoned.into_inner().is_limiting
+        }
+    }
+}
+
+/// ============================================================
+/// Public lifecycle API
+/// ============================================================
 
 pub fn start_limiter(
     state: Arc<Mutex<AppState>>,
     config: Arc<Mutex<Config>>,
     runtime_params: Arc<RuntimeLimiterParams>,
 ) {
-    std::thread::spawn(move || {
-        run_limiter_loop_cable(
-            state,
-            config,
-            runtime_params,
-        );
-    });
+    let generation = AUDIO_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+
+    let state_on_spawn_failure = Arc::clone(&state);
+
+    // 先计数，spawn 失败再回滚，保证 main 的 shutdown wait 不漏线程。
+    ACTIVE_AUDIO_THREADS.fetch_add(1, Ordering::AcqRel);
+
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("sound-lock-audio-{generation}"))
+        .spawn(move || {
+            let _thread_guard = AudioThreadGuard;
+            audio_supervisor(state, config, runtime_params, generation);
+        });
+
+    if let Err(error) = spawn_result {
+        ACTIVE_AUDIO_THREADS.fetch_sub(1, Ordering::AcqRel);
+        log::error!("Failed to spawn audio supervisor: {}", error);
+
+        if AUDIO_GENERATION.load(Ordering::Acquire) == generation {
+            set_limiting_state(&state_on_spawn_failure, false);
+        }
+    }
 }
 
-fn run_limiter_loop_cable(
+/// 主程序退出时等待 Audio Supervisor 自己观察 SHOULD_EXIT 并退出。
+/// 不强杀实时线程，不持有任何 Audio Callback 锁。
+pub fn wait_for_shutdown(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+
+    while ACTIVE_AUDIO_THREADS.load(Ordering::Acquire) != 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    true
+}
+
+/// ============================================================
+/// Audio Supervisor
+/// ============================================================
+
+fn audio_supervisor(
     state: Arc<Mutex<AppState>>,
     config: Arc<Mutex<Config>>,
     runtime_params: Arc<RuntimeLimiterParams>,
+    generation: u64,
 ) {
-    // ========================================================
-    // 读取输入 / 输出设备
-    // ========================================================
+    let _state_guard = LimitingStateGuard::new(Arc::clone(&state), generation);
 
-    let (
-        input_device_id,
-        output_device_id,
-    ) = match config.try_lock() {
+    // 非实时生命周期锁：任何时刻最多只有一个 Supervisor 可以拥有 Stream。
+    // 新 generation 会先让旧 Supervisor 退出，然后在这里接管。
+    let _session_guard = match AUDIO_SESSION_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("Audio session lifecycle mutex poisoned; recovering");
+            poisoned.into_inner()
+        }
+    };
+
+    // 等锁期间用户可能已经再次停止，先重新检查。
+    if !is_requested_to_run(&state, generation) {
+        return;
+    }
+
+    let mut backoff_ms = RECONNECT_BACKOFF_MIN_MS;
+
+    loop {
+        if !is_requested_to_run(&state, generation) {
+            break;
+        }
+
+        match run_limiter_session(
+            &state,
+            &config,
+            Arc::clone(&runtime_params),
+            generation,
+        ) {
+            SessionExit::StopRequested => break,
+
+            SessionExit::Retry { reason, ran_for } => {
+                if !is_requested_to_run(&state, generation) {
+                    break;
+                }
+
+                crate::diagnostics::audio_reconnect_attempt();
+
+                // 如果上一 Session 已稳定运行较长时间，说明更像一次临时掉线，
+                // 下一次从最短 250ms 重连开始。
+                if ran_for >= Duration::from_secs(10) {
+                    backoff_ms = RECONNECT_BACKOFF_MIN_MS;
+                }
+
+                log::warn!(
+                    "Audio session unavailable: {}; retrying in {} ms",
+                    reason,
+                    backoff_ms
+                );
+
+                if !interruptible_sleep(
+                    &state,
+                    generation,
+                    Duration::from_millis(backoff_ms),
+                ) {
+                    break;
+                }
+
+                backoff_ms = (backoff_ms.saturating_mul(2))
+                    .min(RECONNECT_BACKOFF_MAX_MS);
+            }
+        }
+    }
+}
+
+fn interruptible_sleep(
+    state: &Arc<Mutex<AppState>>,
+    generation: u64,
+    duration: Duration,
+) -> bool {
+    let deadline = Instant::now() + duration;
+
+    while Instant::now() < deadline {
+        if !is_requested_to_run(state, generation) {
+            return false;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(CONTROL_POLL));
+    }
+
+    is_requested_to_run(state, generation)
+}
+
+/// ============================================================
+/// 单次 Audio Session
+/// ============================================================
+
+fn run_limiter_session(
+    state: &Arc<Mutex<AppState>>,
+    config: &Arc<Mutex<Config>>,
+    runtime_params: Arc<RuntimeLimiterParams>,
+    generation: u64,
+) -> SessionExit {
+    if !is_requested_to_run(state, generation) {
+        return SessionExit::StopRequested;
+    }
+
+    // 初始化线程不是实时 callback，可以阻塞读取 Config。
+    let (input_device_id, output_device_id) = match config.lock() {
         Ok(cfg) => (
             cfg.target_input_device_id.clone(),
             cfg.target_output_device_id.clone(),
         ),
-
-        Err(_) => {
-            log::error!(
-                "Config lock poisoned"
-            );
-            return;
+        Err(poisoned) => {
+            log::warn!("Config mutex poisoned while starting audio; recovering value");
+            let cfg = poisoned.into_inner();
+            (
+                cfg.target_input_device_id.clone(),
+                cfg.target_output_device_id.clone(),
+            )
         }
     };
 
-    let input_device_id =
-        match input_device_id {
-            Some(id) => id,
-
-            None => {
-                log::error!(
-                    "No input device selected"
-                );
-                return;
+    let input_device_id = match input_device_id {
+        Some(id) => id,
+        None => {
+            return SessionExit::Retry {
+                reason: "no input device selected".to_owned(),
+                ran_for: Duration::ZERO,
             }
-        };
+        }
+    };
 
-    let output_device_id =
-        match output_device_id {
-            Some(id) => id,
-
-            None => {
-                log::error!(
-                    "No output device selected"
-                );
-                return;
+    let output_device_id = match output_device_id {
+        Some(id) => id,
+        None => {
+            return SessionExit::Retry {
+                reason: "no output device selected".to_owned(),
+                ran_for: Duration::ZERO,
             }
-        };
+        }
+    };
 
-    // ========================================================
-    // 获取设备
-    // ========================================================
+    let host = cpal::default_host();
 
-    let host =
-        cpal::default_host();
-
-    let input_devices =
-        match host.input_devices() {
-            Ok(d) => d,
-
-            Err(e) => {
-                log::error!(
-                    "Failed to get input devices: {}",
-                    e
-                );
-                return;
+    let input_devices = match host.input_devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            return SessionExit::Retry {
+                reason: format!("failed to enumerate input devices: {error}"),
+                ran_for: Duration::ZERO,
             }
-        };
+        }
+    };
 
-    let output_devices =
-        match host.output_devices() {
-            Ok(d) => d,
-
-            Err(e) => {
-                log::error!(
-                    "Failed to get output devices: {}",
-                    e
-                );
-                return;
+    let output_devices = match host.output_devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            return SessionExit::Retry {
+                reason: format!("failed to enumerate output devices: {error}"),
+                ran_for: Duration::ZERO,
             }
-        };
+        }
+    };
 
-    let input_device =
-        match input_devices
-            .into_iter()
-            .find(|d| {
-                d.id()
-                    .ok()
-                    .map(|id| {
-                        id.to_string()
-                            == input_device_id
-                    })
-                    .unwrap_or(false)
-            })
-        {
-            Some(d) => d,
-
-            None => {
-                log::error!(
-                    "Input device not found"
-                );
-                return;
+    let input_device = match input_devices.into_iter().find(|device| {
+        device
+            .id()
+            .ok()
+            .map(|id| id.to_string() == input_device_id)
+            .unwrap_or(false)
+    }) {
+        Some(device) => device,
+        None => {
+            return SessionExit::Retry {
+                reason: "selected input device not found".to_owned(),
+                ran_for: Duration::ZERO,
             }
-        };
+        }
+    };
 
-    let output_device =
-        match output_devices
-            .into_iter()
-            .find(|d| {
-                d.id()
-                    .ok()
-                    .map(|id| {
-                        id.to_string()
-                            == output_device_id
-                    })
-                    .unwrap_or(false)
-            })
-        {
-            Some(d) => d,
-
-            None => {
-                log::error!(
-                    "Output device not found"
-                );
-                return;
+    let output_device = match output_devices.into_iter().find(|device| {
+        device
+            .id()
+            .ok()
+            .map(|id| id.to_string() == output_device_id)
+            .unwrap_or(false)
+    }) {
+        Some(device) => device,
+        None => {
+            return SessionExit::Retry {
+                reason: "selected output device not found".to_owned(),
+                ran_for: Duration::ZERO,
             }
-        };
+        }
+    };
 
-    // ========================================================
-    // 获取音频格式
-    // ========================================================
-
-    let stream_config: StreamConfig =
-        match input_device
-            .default_input_config()
-        {
-            Ok(cfg) => cfg.into(),
-
-            Err(e) => {
-                log::error!(
-                    "Failed to get input config: {}",
-                    e
-                );
-                return;
+    let stream_config: StreamConfig = match input_device.default_input_config() {
+        Ok(config) => config.into(),
+        Err(error) => {
+            return SessionExit::Retry {
+                reason: format!("failed to get input config: {error}"),
+                ran_for: Duration::ZERO,
             }
-        };
+        }
+    };
 
-    // ========================================================
-    // Stereo Link 要求双声道
-    // ========================================================
-    //
-    // 新版 Limiter 是：
-    //
-    //     L ─┐
-    //        ├→ 同一个 RMS / Peak Detector
-    //     R ─┘
-    //                ↓
-    //          共用一个 Gain
-    //
-    // 所以这里明确要求 Stereo。
-    //
-    let channels =
-        stream_config.channels as usize;
-
+    let channels = stream_config.channels as usize;
     if channels != 2 {
-        log::error!(
-            "PUBG limiter requires stereo input, \
-             but current device has {} channel(s)",
-            channels
-        );
-
-        return;
+        return SessionExit::Retry {
+            reason: format!(
+                "PUBG limiter requires stereo input, current device has {channels} channel(s)"
+            ),
+            ran_for: Duration::ZERO,
+        };
     }
 
-    // ========================================================
-    // 创建 Limiter，并设置真实采样率
-    // ========================================================
-    //
-    // Limiter 不再放进 Arc<Mutex<...>>。
-    //
-    // 它会在下面被 move 进 Input Callback，
-    // 由该实时回调独占整个生命周期。
-    //
-    // UI / 控制线程只通过 RuntimeLimiterParams
-    // 发布参数，不直接访问 Limiter。
+    let sample_rate = stream_config.sample_rate as f32;
 
-    let mut limiter =
-        LoudnessLimiter::new(
-            Arc::clone(&runtime_params),
-        );
+    crate::diagnostics::configure_audio_monitor(sample_rate, LOOKAHEAD_MS as f32);
+    let _monitor_guard = SessionMonitorGuard::new(generation);
 
-    limiter.set_sample_rate(
-        stream_config.sample_rate as f32,
+    // Limiter 被 move 进 Input Callback，整个 Session 中只有这一位 owner。
+    let mut limiter = LoudnessLimiter::new(runtime_params);
+    limiter.set_sample_rate(sample_rate);
+
+    // ========================================================
+    // Stereo Frame Ring Buffer
+    // ========================================================
+    let target_latency_frames = (((TARGET_RING_LATENCY_MS / 1000.0) * sample_rate)
+        .round() as usize)
+        .max(1);
+
+    let ring_capacity_frames = target_latency_frames
+        .saturating_mul(2)
+        .max(2);
+
+    let ring = HeapRb::<(f32, f32)>::new(ring_capacity_frames);
+    let (mut producer, mut consumer) = ring.split();
+
+    for _ in 0..target_latency_frames {
+        let _ = producer.try_push((0.0, 0.0));
+    }
+
+    crate::diagnostics::configure_ring_monitor(
+        target_latency_frames,
+        ring_capacity_frames,
     );
 
-    // ========================================================
-    // Ring Buffer
-    // ========================================================
+    let stream_failed = Arc::new(AtomicBool::new(false));
 
-    let latency_ms =
-        150.0f32;
-
-    let latency_frames =
-        (
-            latency_ms / 1_000.0
-        )
-            * stream_config.sample_rate
-                as f32;
-
-    let latency_samples =
-        (latency_frames as usize)
-            * channels;
-
-    let ring =
-        HeapRb::<f32>::new(
-            latency_samples * 2,
-        );
-
-    let (
-        mut producer,
-        mut consumer,
-    ) = ring.split();
-
-    // 预填充静音，
-    // 保证 output callback 启动时不会立即 underrun。
-    for _ in 0..latency_samples {
-        let _ =
-            producer.try_push(0.0);
-    }
+    // 重建 Stream 后仅对最前面的 10ms 捕获音频做淡入。
+    // 淡入发生在 Limiter 之后且 gain <= 1，不会改变 Ceiling，也不会改变稳定运行时 DSP。
+    let fade_total_frames = ((sample_rate * RECONNECT_FADE_MS / 1000.0).round() as usize)
+        .max(1);
+    let mut fade_frame_index = 0usize;
 
     // ========================================================
     // Input Callback
     // ========================================================
-    //
-    // 当前数据流保持不变：
-    //
-    // Input
-    //   ↓
-    // Limiter
-    //   ↓
-    // Ring Buffer
-    //   ↓
-    // Output
-    //
-    // 与旧版不同的是：
-    //
-    // LoudnessLimiter 现在直接被这个 callback closure 独占，
-    // 不再通过 Arc<Mutex<LoudnessLimiter>> 跨线程共享。
-    //
-    // 因此实时音频路径中：
-    //
-    // - 没有 limiter.lock()
-    // - 没有 limiter.try_lock()
-    // - 没有 limiter_lock_miss
-    // - 不会因为 UI / 控制线程占锁而旁路 Limiter
+    let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
+        crate::diagnostics::input_callback();
+        limiter.begin_audio_callback();
 
-    let input_data_fn =
-        move |
-            data: &[f32],
-            _: &cpal::InputCallbackInfo,
-        | {
-            crate::diagnostics::
-                input_callback();
+        let mut index = 0usize;
 
-            // ================================================
-            // 每个 Audio Callback 只同步一次参数
-            // ================================================
-            //
-            // 正常情况下只检查一次 Atomic version。
-            //
-            // 只有 UI 发布了新参数时，
-            // 才会读取新快照并重新计算相关系数。
-            //
-            // process_stereo_frame() 内部不会再次检查版本。
-            limiter.begin_audio_callback();
+        while index + 1 < data.len() {
+            let (mut left, mut right) =
+                limiter.process_stereo_frame(data[index], data[index + 1]);
 
-            // ================================================
-            // Stereo Frame 处理
-            // ================================================
-            //
-            // data:
-            //
-            // L R L R L R ...
-            //
-            // 左右声道必须作为同一个 Stereo Frame
-            // 一起交给 Limiter，保证：
-            //
-            // - Stereo Linked RMS
-            // - Stereo Linked Peak
-            // - 左右共用同一个 Gain
-            // - 不破坏 PUBG 方位感
-
-            let mut frames =
-                data.chunks_exact(2);
-
-            for frame in
-                &mut frames
-            {
-                let left =
-                    frame[0];
-
-                let right =
-                    frame[1];
-
-                let (
-                    processed_left,
-                    processed_right,
-                ) =
-                    limiter
-                        .process_stereo_frame(
-                            left,
-                            right,
-                        );
-
-                // 左声道
-                if producer
-                    .try_push(
-                        processed_left,
-                    )
-                    .is_err()
-                {
-                    crate::diagnostics::
-                        ring_push_drop();
-                }
-
-                // 右声道
-                if producer
-                    .try_push(
-                        processed_right,
-                    )
-                    .is_err()
-                {
-                    crate::diagnostics::
-                        ring_push_drop();
-                }
+            if fade_frame_index < fade_total_frames {
+                let fade_gain = (fade_frame_index + 1) as f32 / fade_total_frames as f32;
+                fade_frame_index += 1;
+                left *= fade_gain;
+                right *= fade_gain;
             }
 
-            // Stereo interleaved callback 正常情况下
-            // data.len() 必须是 2 的整数倍。
-            //
-            // 如果极端情况下出现 1 个 remainder sample，
-            // 这里故意不把它单独写入 Ring Buffer。
-            //
-            // 原因：
-            // 单独写入一个 sample 会让后续 L/R 交错相位错位，
-            // 比丢掉这个异常 sample 更严重。
-            let _ =
-                frames.remainder();
-        };
+            if producer.try_push((left, right)).is_err() {
+                crate::diagnostics::ring_push_drop();
+            }
+
+            index += 2;
+        }
+
+        // 奇数 remainder sample 故意丢弃，绝不破坏 L/R frame 对齐。
+        crate::diagnostics::ring_fill_sample(producer.occupied_len());
+    };
 
     // ========================================================
     // Output Callback
     // ========================================================
+    let output_data_fn = move |out_data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        crate::diagnostics::output_callback();
 
-    let output_data_fn =
-        move |
-            out_data: &mut [f32],
-            _: &cpal::OutputCallbackInfo,
-        | {
-            crate::diagnostics::
-                output_callback();
+        let mut fell_behind = false;
+        let mut last_frame = (0.0f32, 0.0f32);
+        let mut index = 0usize;
 
-            let mut fell_behind =
-                false;
-
-            let mut last_sample =
-                0.0f32;
-
-            for sample in
-                out_data.iter_mut()
-            {
-                *sample =
-                    match consumer.try_pop()
-                    {
-                        Some(s) => {
-                            last_sample =
-                                s;
-
-                            s
-                        }
-
-                        None => {
-                            fell_behind =
-                                true;
-
-                            // 保持最后一个 sample，
-                            // 避免突然输出随机数据。
-                            last_sample
-                        }
-                    };
+        while index + 1 < out_data.len() {
+            match consumer.try_pop() {
+                Some((left, right)) => {
+                    last_frame = (left, right);
+                    out_data[index] = left;
+                    out_data[index + 1] = right;
+                }
+                None => {
+                    fell_behind = true;
+                    out_data[index] = last_frame.0;
+                    out_data[index + 1] = last_frame.1;
+                }
             }
 
-            if fell_behind {
-                crate::diagnostics::
-                    output_underrun();
+            index += 2;
+        }
 
-                log::warn!(
-                    "Input buffer empty"
-                );
-            }
-        };
+        if index < out_data.len() {
+            out_data[index] = 0.0;
+        }
+
+        if fell_behind {
+            crate::diagnostics::output_underrun();
+        }
+
+        crate::diagnostics::ring_fill_sample(consumer.occupied_len());
+    };
 
     // ========================================================
     // Error Callback
     // ========================================================
+    let input_failed = Arc::clone(&stream_failed);
+    let input_err_fn = move |_error| {
+        crate::diagnostics::input_error();
+        input_failed.store(true, Ordering::Release);
+        // Error callback 只发信号，不做日志格式化 / I/O。
+        // Supervisor 会在非实时控制线程记录重连原因。
+    };
 
-    let input_err_fn =
-        |err| {
-            crate::diagnostics::
-                input_error();
-
-            log::error!(
-                "Input stream error: {}",
-                err
-            );
-        };
-
-    let output_err_fn =
-        |err| {
-            crate::diagnostics::
-                output_error();
-
-            log::error!(
-                "Output stream error: {}",
-                err
-            );
-        };
+    let output_failed = Arc::clone(&stream_failed);
+    let output_err_fn = move |_error| {
+        crate::diagnostics::output_error();
+        output_failed.store(true, Ordering::Release);
+        // 同上：实时相关 callback 只做 Atomic 信号。
+    };
 
     // ========================================================
-    // 创建 Stream
+    // Build / Start Stream
     // ========================================================
-
-    let input_stream =
-        match input_device
-            .build_input_stream(
-                &stream_config,
-                input_data_fn,
-                input_err_fn,
-                None,
-            )
-        {
-            Ok(s) => s,
-
-            Err(e) => {
-                log::error!(
-                    "Failed to build input stream: {}",
-                    e
-                );
-                return;
+    let input_stream = match input_device.build_input_stream(
+        &stream_config,
+        input_data_fn,
+        input_err_fn,
+        None,
+    ) {
+        Ok(stream) => stream,
+        Err(error) => {
+            return SessionExit::Retry {
+                reason: format!("failed to build input stream: {error}"),
+                ran_for: Duration::ZERO,
             }
-        };
+        }
+    };
 
-    let output_stream =
-        match output_device
-            .build_output_stream(
-                &stream_config,
-                output_data_fn,
-                output_err_fn,
-                None,
-            )
-        {
-            Ok(s) => s,
-
-            Err(e) => {
-                log::error!(
-                    "Failed to build output stream: {}",
-                    e
-                );
-                return;
+    // 保持现有工作路径：输出 Stream 使用与输入一致的 StreamConfig。
+    // 如果未来需要支持不同采样率/声道，应单独加入 SRC，不在这里隐式改格式。
+    let output_stream = match output_device.build_output_stream(
+        &stream_config,
+        output_data_fn,
+        output_err_fn,
+        None,
+    ) {
+        Ok(stream) => stream,
+        Err(error) => {
+            return SessionExit::Retry {
+                reason: format!("failed to build output stream: {error}"),
+                ran_for: Duration::ZERO,
             }
+        }
+    };
+
+    if let Err(error) = input_stream.play() {
+        return SessionExit::Retry {
+            reason: format!("failed to start input stream: {error}"),
+            ran_for: Duration::ZERO,
         };
-
-    // ========================================================
-    // 启动
-    // ========================================================
-
-    if let Err(e) =
-        input_stream.play()
-    {
-        log::error!(
-            "Failed to start input stream: {}",
-            e
-        );
-
-        return;
     }
 
-    if let Err(e) =
-        output_stream.play()
-    {
-        log::error!(
-            "Failed to start output stream: {}",
-            e
-        );
-
-        return;
+    if let Err(error) = output_stream.play() {
+        return SessionExit::Retry {
+            reason: format!("failed to start output stream: {error}"),
+            ran_for: Duration::ZERO,
+        };
     }
 
-    // ========================================================
-    // 主控制循环
-    // ========================================================
+    crate::diagnostics::audio_session_started();
+    let started_at = Instant::now();
 
+    // ========================================================
+    // Session 控制循环
+    // ========================================================
     loop {
-        let should_continue =
-            loop {
-                match state.try_lock() {
-                    Ok(s) => {
-                        break s.is_limiting;
-                    }
-
-                    Err(
-                        std::sync::
-                            TryLockError::
-                            WouldBlock,
-                    ) => {
-                        std::thread::sleep(
-                            Duration::
-                                from_millis(10),
-                        );
-
-                        continue;
-                    }
-
-                    Err(_) => {
-                        break false;
-                    }
-                }
-            };
-
-        // 检查退出标志
-        let should_exit =
-            crate::tray_state::
-                SHOULD_EXIT
-                .load(
-                    std::sync::atomic::
-                        Ordering::SeqCst,
-                );
-
-        if !should_continue
-            || should_exit
-        {
-            break;
+        if !is_requested_to_run(state, generation) {
+            drop(input_stream);
+            drop(output_stream);
+            return SessionExit::StopRequested;
         }
 
-        std::thread::sleep(
-            Duration::from_secs(1),
-        );
-    }
+        if stream_failed.load(Ordering::Acquire) {
+            let ran_for = started_at.elapsed();
+            drop(input_stream);
+            drop(output_stream);
+            return SessionExit::Retry {
+                reason: "CPAL reported a runtime stream error".to_owned(),
+                ran_for,
+            };
+        }
 
-    drop(input_stream);
-    drop(output_stream);
+        std::thread::sleep(CONTROL_POLL);
+    }
 }

@@ -98,11 +98,12 @@ impl SettingsWindow {
     }
 
     fn save_config(config: Config) {
-        std::thread::spawn(move || {
-            if let Err(e) = config.save() {
-                log::error!("Failed to save config: {}", e);
-            }
-        });
+        // Config 很小，而且 save() 本身已经使用临时文件 + 原子替换。
+        // 在 UI 配置锁释放后同步保存，避免多个短命保存线程乱序覆盖。
+        // 这不会阻塞 Audio Callback，因为实时音频从不访问 Config 文件。
+        if let Err(e) = config.save() {
+            log::error!("Failed to save config: {}", e);
+        }
     }
 
     fn start_limiting(&mut self, ctx: &Context) {
@@ -753,8 +754,8 @@ impl eframe::App for SettingsWindow {
             }
         }
 
-        // 保存在线程外使用 Config clone，
-        // 不持有 UI 的 Config Mutex。
+        // 使用 Config clone 保存；此时已经释放 UI 的 Config Mutex。
+        // 保存只影响 UI 线程，不会进入实时 Audio Callback。
         if let Some(config) = config_snapshot_for_save {
             Self::save_config(config);
         }
