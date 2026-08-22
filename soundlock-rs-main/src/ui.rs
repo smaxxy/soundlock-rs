@@ -97,15 +97,11 @@ impl SettingsWindow {
         }
     }
 
-    fn save_config(config: Config) {
-        // Config 很小，而且 save() 本身已经使用临时文件 + 原子替换。
-        // 在 UI 配置锁释放后同步保存，避免多个短命保存线程乱序覆盖。
-        // 这不会阻塞 Audio Callback，因为实时音频从不访问 Config 文件。
-        if let Err(e) = config.save() {
-            log::error!("Failed to save config: {}", e);
-        }
+   fn save_config(config: Config) {
+    if let Err(e) = config.save() {
+        log::error!("Failed to save config: {}", e);
     }
-
+}
     fn start_limiting(&mut self, ctx: &Context) {
         let (input_id, output_id) = {
             match self.config.try_lock() {
@@ -674,37 +670,48 @@ impl eframe::App for SettingsWindow {
                 limiter_params_changed = true;
                 any_config_changed = true;
             }
+// ------------------------------------------------
+// 设备参数
+// ------------------------------------------------
+//
+// 只有 UI 当前确实选中了一个有效设备时，
+// 才允许覆盖 Config 中已有的设备 ID。
+//
+// 特别重要：
+// UI 重建时设备列表是异步加载的。
+// 在设备列表尚未加载完成的前几帧：
+//
+//     input_devices = []
+//     output_devices = []
+//     selected_*_idx = usize::MAX
+//
+// 此时绝不能把 Config 中原有设备 ID 写成 None。
 
-            // ------------------------------------------------
-            // 设备参数
-            // ------------------------------------------------
-            //
-            // 设备变化只写 Config。
-            // 不需要 publish RuntimeLimiterParams。
-            //
-            // 当前 Stream 运行期间不支持热切设备，
-            // 所以 UI 下面会在运行中禁用设备选择。
+if let Some((_, input_id)) =
+    self.input_devices.get(self.selected_input_idx)
+{
+    if config.target_input_device_id.as_ref()
+        != Some(input_id)
+    {
+        config.target_input_device_id =
+            Some(input_id.clone());
 
-            let new_input_id = self
-                .input_devices
-                .get(self.selected_input_idx)
-                .map(|(_, id)| id.clone());
+        any_config_changed = true;
+    }
+}
 
-            if new_input_id != config.target_input_device_id {
-                config.target_input_device_id = new_input_id;
-                any_config_changed = true;
-            }
+if let Some((_, output_id)) =
+    self.output_devices.get(self.selected_output_idx)
+{
+    if config.target_output_device_id.as_ref()
+        != Some(output_id)
+    {
+        config.target_output_device_id =
+            Some(output_id.clone());
 
-            let new_output_id = self
-                .output_devices
-                .get(self.selected_output_idx)
-                .map(|(_, id)| id.clone());
-
-            if new_output_id != config.target_output_device_id {
-                config.target_output_device_id = new_output_id;
-                any_config_changed = true;
-            }
-
+        any_config_changed = true;
+    }
+}
             // ------------------------------------------------
             // DSP 参数即时发布
             // ------------------------------------------------
