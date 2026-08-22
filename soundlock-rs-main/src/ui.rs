@@ -24,6 +24,7 @@ pub struct SettingsWindow {
     pending_devices: Arc<Mutex<Option<(Vec<(Device, String)>, Vec<(Device, String)>)>>>,
     last_config_change: Instant,
     pending_save: bool,
+    show_raw_recorder: bool,
 }
 
 impl SettingsWindow {
@@ -58,6 +59,7 @@ impl SettingsWindow {
             pending_devices,
             last_config_change: Instant::now(),
             pending_save: false,
+            show_raw_recorder: false,
         }
     }
 
@@ -106,10 +108,7 @@ impl SettingsWindow {
         let (input_id, output_id) = {
             match self.config.try_lock() {
                 Ok(cfg) => {
-                    // 启动前再发布一次当前完整 Limiter 参数。
-                    //
-                    // 正常情况下 UI 在本帧配置写回阶段已经 publish，
-                    // 这里属于启动时的最后一致性保护。
+                    // 启动前发布完整参数，保证 Session 使用本帧最新配置。
                     self.runtime_params.publish_config(&cfg);
 
                     (
@@ -167,8 +166,6 @@ impl SettingsWindow {
             }
         }
 
-        // audio::start_limiter() 自己已经负责 spawn 后台音频线程，
-        // UI 不需要再额外包一层 std::thread::spawn。
         audio::start_limiter(
             Arc::clone(&self.state),
             Arc::clone(&self.config),
@@ -206,9 +203,7 @@ impl SettingsWindow {
             Ok(cfg) => cfg.clone(),
 
             Err(std::sync::TryLockError::WouldBlock) => {
-                // UI 正在退出，配置量很小。
-                // try_lock 偶发失败时再退回 blocking lock，
-                // 保证最后一次修改不会因为窗口关闭而丢失。
+                // 退出时允许阻塞取锁，保证最后一次修改不会丢失。
                 match self.config.lock() {
                     Ok(cfg) => cfg.clone(),
 
@@ -229,10 +224,7 @@ impl SettingsWindow {
             }
         };
 
-        // 退出 UI 时同步保存。
-        //
-        // 这里不再新开线程，避免窗口已经释放时
-        // 最后一份配置仍在后台等待写盘。
+        // 退出时同步保存，避免窗口释放后仍有配置等待写盘。
         if let Err(e) = config.save() {
             log::error!("Failed to save config on exit: {}", e);
         }
@@ -243,8 +235,6 @@ impl SettingsWindow {
 
 impl eframe::App for SettingsWindow {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        crate::diagnostics::ui_tick();
-
         let devices_updated = {
             if let Ok(mut pending) = self.pending_devices.try_lock() {
                 if let Some((input, output)) = pending.take() {
@@ -309,6 +299,33 @@ impl eframe::App for SettingsWindow {
             }
         };
 
+        let recorder_status = audio::recorder::status();
+        let recorder_in_flight = recorder_status.requested
+            || matches!(
+                recorder_status.state,
+                audio::recorder::RecordingState::Starting
+                    | audio::recorder::RecordingState::Recording
+                    | audio::recorder::RecordingState::Saving
+            );
+
+        if recorder_in_flight {
+            self.show_raw_recorder = true;
+        }
+
+        if recorder_in_flight
+            || (self.show_raw_recorder
+                && is_limiting
+                && !recorder_status.session_available
+                && matches!(
+                    recorder_status.state,
+                    audio::recorder::RecordingState::Idle
+                ))
+        {
+            ctx.request_repaint_after(
+                std::time::Duration::from_millis(100),
+            );
+        }
+
         let (
             mut threshold_db,
             mut attack_ms,
@@ -333,10 +350,7 @@ impl eframe::App for SettingsWindow {
             }
         };
 
-        // UI 按钮动作延后到本帧配置写回之后执行。
-        //
-        // 这样同一帧里“修改参数 / 选择设备 → 点击启动或保存”
-        // 一定使用本帧最新值，而不是上一帧的 Config。
+        // 按钮动作延后至配置写回后，确保使用本帧最新值。
         let mut start_clicked = false;
         let mut stop_clicked = false;
         let mut save_clicked = false;
@@ -594,17 +608,190 @@ impl eframe::App for SettingsWindow {
                             save_clicked = true;
                         }
                     });
-                    ui.separator();
+
+                    if self.show_raw_recorder {
+                        let recording_snapshot = audio::recorder::snapshot();
+                        ui.group(|ui| {
+                            ui.label("原始游戏声音录制（Limiter 处理前）");
+
+                        let recorder_busy = recording_snapshot.requested
+                            || matches!(
+                                recording_snapshot.state,
+                                audio::recorder::RecordingState::Starting
+                                    | audio::recorder::RecordingState::Recording
+                            );
+                        let recorder_saving = matches!(
+                            recording_snapshot.state,
+                            audio::recorder::RecordingState::Saving
+                        );
+
+                        ui.horizontal(|ui| {
+                            let record_button_size = Vec2::new(180.0, 40.0);
+
+                            if recorder_busy {
+                                if ui
+                                    .add_sized(
+                                        record_button_size,
+                                        Button::new("停止并保存")
+                                            .fill(Color32::from_rgb(190, 45, 45)),
+                                    )
+                                    .clicked()
+                                {
+                                    audio::recorder::request_stop();
+                                    ctx.request_repaint_after(
+                                        std::time::Duration::from_millis(16),
+                                    );
+                                }
+                            } else if recorder_saving {
+                                ui.add_enabled(
+                                    false,
+                                    Button::new("正在保存 WAV…")
+                                        .min_size(record_button_size),
+                                );
+                            } else if ui
+                                .add_enabled(
+                                    is_limiting
+                                        && recording_snapshot.session_available,
+                                    Button::new("开始录制原始声音")
+                                        .min_size(record_button_size)
+                                        .fill(Color32::from_rgb(30, 120, 190)),
+                                )
+                                .clicked()
+                            {
+                                if let Err(message) =
+                                    audio::recorder::request_start()
+                                {
+                                    log::warn!(
+                                        "Cannot start raw recording: {}",
+                                        message
+                                    );
+                                }
+                                ctx.request_repaint_after(
+                                    std::time::Duration::from_millis(16),
+                                );
+                            }
+
+                            if ui.button("打开录音文件夹").clicked() {
+                                let directory =
+                                    audio::recorder::recordings_dir();
+                                std::thread::spawn(move || {
+                                    if let Err(error) =
+                                        std::fs::create_dir_all(&directory)
+                                    {
+                                        log::error!(
+                                            "Failed to create recording directory: {}",
+                                            error
+                                        );
+                                    } else if let Err(error) =
+                                        open::that(&directory)
+                                    {
+                                        log::error!(
+                                            "Failed to open recording directory: {}",
+                                            error
+                                        );
+                                    }
+                                });
+                            }
+                        });
+
+                        let elapsed =
+                            recording_snapshot.elapsed_seconds.max(0.0) as u64;
+                        let elapsed_text =
+                            format!("{:02}:{:02}", elapsed / 60, elapsed % 60);
+
+                        match recording_snapshot.state {
+                            audio::recorder::RecordingState::Starting => {
+                                ui.colored_label(
+                                    Color32::YELLOW,
+                                    "正在创建录音文件…",
+                                );
+                            }
+                            audio::recorder::RecordingState::Recording => {
+                                ui.colored_label(
+                                    Color32::from_rgb(0, 200, 0),
+                                    format!(
+                                        "● 正在录制 {elapsed_text}（最长 {} 秒）",
+                                        audio::recorder::MAX_RECORDING_SECONDS
+                                    ),
+                                );
+                            }
+                            audio::recorder::RecordingState::Saving => {
+                                ui.label("正在排空录音缓冲并完成 WAV 文件…");
+                            }
+                            audio::recorder::RecordingState::Saved => {
+                                if let Some(path) =
+                                    recording_snapshot.last_path.as_ref()
+                                {
+                                    ui.colored_label(
+                                        Color32::from_rgb(0, 180, 0),
+                                        format!("已保存：{}", path.display()),
+                                    );
+                                }
+                            }
+                            audio::recorder::RecordingState::Error => {
+                                ui.colored_label(
+                                    Color32::RED,
+                                    recording_snapshot
+                                        .last_error
+                                        .as_deref()
+                                        .unwrap_or(
+                                            "原始录音失败，请停止并重新启动限制后重试",
+                                        ),
+                                );
+                            }
+                            audio::recorder::RecordingState::Idle => {
+                                if is_limiting
+                                    && !recording_snapshot.session_available
+                                {
+                                    ui.label("音频正在准备，稍后即可录制。");
+                                } else if !is_limiting {
+                                    ui.label(
+                                        "请先启动限制；录制时耳机仍播放安全的限幅后声音。",
+                                    );
+                                } else {
+                                    ui.label(
+                                        "录到的 WAV 不含 Pre-Gain、RMS、Peak、Lookahead 或 Ceiling 处理。",
+                                    );
+                                }
+                            }
+                        }
+
+                            if recording_snapshot.dropped_frames != 0 {
+                                ui.colored_label(
+                                    Color32::RED,
+                                    format!(
+                                        "录音缓冲丢失 {} 帧，请重新录制这一段。",
+                                        recording_snapshot.dropped_frames
+                                    ),
+                                );
+                            }
+                        });
+                        ui.separator();
+                    }
+
                     ui.add_space(15.0);
                     ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-                        ui.hyperlink_to("GitHub", "https://github.com/winsrewu/soundlock-rs");
+                        ui.horizontal(|ui| {
+                            let recorder_button_text =
+                                if recorder_in_flight { "●" } else { "···" };
+                            let recorder_toggle = ui
+                                .small_button(recorder_button_text)
+                                .on_hover_text("原始录音工具");
+
+                            if recorder_toggle.clicked() && !recorder_in_flight {
+                                self.show_raw_recorder = !self.show_raw_recorder;
+                            }
+
+                            ui.hyperlink_to(
+                                "GitHub",
+                                "https://github.com/winsrewu/soundlock-rs",
+                            );
+                        });
                     });
                 });
         });
 
-        // ====================================================
         // 写回配置 + Runtime 参数即时发布
-        // ====================================================
 
         let mut config_snapshot_for_save: Option<Config> = None;
 
@@ -613,11 +800,7 @@ impl eframe::App for SettingsWindow {
                 Ok(c) => c,
 
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    // 本帧暂时写不回配置。
-                    //
-                    // 如果用户这一帧点击了启动，
-                    // 记录 retry，下一帧/后续重试再启动，
-                    // 避免使用旧设备或旧参数。
+                    // 写回失败时延迟启动，避免使用旧设备或旧参数。
                     if start_clicked {
                         self.retry_start = true;
                     }
@@ -637,9 +820,7 @@ impl eframe::App for SettingsWindow {
             let mut limiter_params_changed = false;
             let mut any_config_changed = false;
 
-            // ------------------------------------------------
             // Limiter DSP 参数
-            // ------------------------------------------------
 
             if threshold_db != config.threshold_db {
                 config.threshold_db = threshold_db;
@@ -670,22 +851,7 @@ impl eframe::App for SettingsWindow {
                 limiter_params_changed = true;
                 any_config_changed = true;
             }
-// ------------------------------------------------
-// 设备参数
-// ------------------------------------------------
-//
-// 只有 UI 当前确实选中了一个有效设备时，
-// 才允许覆盖 Config 中已有的设备 ID。
-//
-// 特别重要：
-// UI 重建时设备列表是异步加载的。
-// 在设备列表尚未加载完成的前几帧：
-//
-//     input_devices = []
-//     output_devices = []
-//     selected_*_idx = usize::MAX
-//
-// 此时绝不能把 Config 中原有设备 ID 写成 None。
+// 设备列表异步加载完成前，不得用无效选择覆盖 Config 中已有的设备 ID。
 
 if let Some((_, input_id)) =
     self.input_devices.get(self.selected_input_idx)
@@ -712,35 +878,19 @@ if let Some((_, output_id)) =
         any_config_changed = true;
     }
 }
-            // ------------------------------------------------
             // DSP 参数即时发布
-            // ------------------------------------------------
-            //
-            // 只有 5 个 Limiter 参数真正变化时才 bump version。
-            //
-            // 单纯刷新设备 / 选择设备不会让 Audio Callback
-            // 无意义地重新计算 RMS / Peak 系数。
+            // 仅参数变化时 bump version，避免回调无意义地重算系数。
             if limiter_params_changed {
                 self.runtime_params.publish_config(&config);
             }
 
-            // ------------------------------------------------
             // 保存节流
-            // ------------------------------------------------
-            //
-            // 改成 trailing debounce：
-            //
-            // 每次有新修改 → 重置计时
-            // 停止修改 500ms 后 → 保存一次
-            //
-            // 避免拖动滑块时每 500ms 都创建保存线程。
+            // trailing debounce：停止修改 500ms 后保存一次。
             if any_config_changed {
                 self.pending_save = true;
                 self.last_config_change = Instant::now();
 
-                // eframe 不保证没有输入事件时持续刷新。
-                // 明确安排一次未来 repaint，确保 trailing debounce
-                // 在停止操作 500ms 后真正执行保存。
+                // 安排未来 repaint，保证无输入事件时 debounce 仍会触发。
                 ctx.request_repaint_after(
                     std::time::Duration::from_millis(500),
                 );
@@ -767,10 +917,7 @@ if let Some((_, output_id)) =
             Self::save_config(config);
         }
 
-        // ====================================================
         // 执行本帧按钮动作
-        // ====================================================
-        //
         // 必须在 Config 写回 / Runtime publish 之后。
         if start_clicked {
             self.start_limiting(ctx);

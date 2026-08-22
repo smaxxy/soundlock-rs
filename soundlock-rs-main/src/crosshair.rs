@@ -81,38 +81,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 
-// ============================================================
 // 准星参数
-// ============================================================
 
-/// 准星透明窗口大小。
-///
-/// 80×80 = 6400 像素。
-/// 32-bit BGRA 缓冲区仅约 25 KB。
+/// 准星透明窗口边长（物理像素）。
 const WINDOW_SIZE: i32 = 80;
 
-/// 状态检查周期。
-///
-/// 20ms = 50Hz。
-///
-/// 只做：
-/// - 准星开关检查
-/// - 右键检查
-/// - 颜色 / 大小是否变化
-///
-/// 不会每 20ms 重绘。
+/// 状态检查周期；仅样式变化时重绘。
 const UPDATE_INTERVAL_MS: u32 = 20;
 
-/// 4×4 supersampling。
-///
-/// 仅在真正需要重绘时运行：
-/// - 第一次创建
-/// - 颜色改变
-/// - 大小改变
-/// - 显示分辨率改变
-///
-/// 80×80×16 ≈ 10 万个非常简单的距离比较，
-/// 且不是持续运行，对 CPU 几乎没有影响。
+/// 抗锯齿 supersampling 网格边长。
 const AA_GRID: i32 = 4;
 const AA_SAMPLES: i32 = AA_GRID * AA_GRID;
 
@@ -124,10 +101,6 @@ static LAST_CROSSHAIR_COLOR: AtomicU32 =
 static LAST_CROSSHAIR_SIZE: AtomicU32 =
     AtomicU32::new(u32::MAX);
 
-
-// ============================================================
-// 启动准星线程
-// ============================================================
 
 pub fn start_crosshair() {
     std::thread::spawn(|| {
@@ -141,14 +114,9 @@ pub fn start_crosshair() {
 }
 
 
-// ============================================================
-// 屏幕中心
-// ============================================================
-
 /// 返回准星 80×80 窗口左上角。
 ///
-/// crosshair 线程会设为 PER_MONITOR_AWARE_V2，
-/// 所以这里使用的是该线程对应的真实屏幕坐标体系。
+/// 线程使用 PER_MONITOR_AWARE_V2，因此坐标为真实物理像素。
 unsafe fn centered_window_position() -> POINT {
     let screen_width =
         GetSystemMetrics(
@@ -172,33 +140,9 @@ unsafe fn centered_window_position() -> POINT {
 }
 
 
-// ============================================================
-// 抗锯齿准星渲染
-// ============================================================
-
-/// 使用 32-bit premultiplied BGRA + UpdateLayeredWindow
-/// 提交一个真正带 alpha 的抗锯齿圆。
-///
-/// 重要：
-///
-/// 这里不是传统 GDI Ellipse。
-///
-/// 原来的 GDI Ellipse：
-/// - 整数像素栅格
-/// - 没有真正抗锯齿
-/// - 很小的圆视觉上容易“歪”或有锯齿
-///
-/// 现在：
-/// - 4×4 supersampling
-/// - 每像素 alpha
-/// - 圆心固定为 (40.0, 40.0)
-/// - 奇数 / 偶数直径都围绕同一个几何中心
-///
-/// 这能避免原来：
-///
-///     (80 - diameter) / 2
-///
-/// 在奇数 diameter 时丢掉 0.5 像素的问题。
+/// 用 4×4 supersampling 生成 premultiplied BGRA，并通过
+/// UpdateLayeredWindow 提交每像素 alpha。圆心固定在窗口几何中心，
+/// 因而奇数和偶数直径保持同心。
 unsafe fn render_crosshair(
     hwnd: HWND,
     rgb: u32,
@@ -210,8 +154,7 @@ unsafe fn render_crosshair(
             (WINDOW_SIZE - 2) as u32,
         ) as f32;
 
-    // UI 保存格式：
-    // 0x00RRGGBB
+    // UI 颜色格式：0x00RRGGBB。
     let r =
         ((rgb >> 16) & 0xFF)
             as u32;
@@ -224,9 +167,7 @@ unsafe fn render_crosshair(
         (rgb & 0xFF)
             as u32;
 
-    // --------------------------------------------------------
     // 创建 80×80、32-bit、top-down DIB
-    // --------------------------------------------------------
 
     let mut bitmap_info =
         BITMAPINFO::default();
@@ -319,9 +260,7 @@ unsafe fn render_crosshair(
             ),
         );
 
-    // --------------------------------------------------------
     // 直接在 DIB 内存里生成圆
-    // --------------------------------------------------------
 
     let pixel_count =
         (WINDOW_SIZE
@@ -335,16 +274,10 @@ unsafe fn render_crosshair(
                 pixel_count,
             );
 
-    // 整个窗口背景 alpha=0，
-    // 完全透明。
+    // 背景 alpha=0。
     pixels.fill(0);
 
-    // 几何圆心固定在窗口真正中心：
-    //
-    // 80 / 2 = 40.0
-    //
-    // 注意这里故意不是 39.5 / 40.5。
-    // 对于偶数像素宽度，几何中心本来就在像素边界上。
+    // 偶数像素宽度的几何中心位于像素边界。
     let center =
         WINDOW_SIZE as f32
             * 0.5;
@@ -362,10 +295,7 @@ unsafe fn render_crosshair(
             let mut inside =
                 0i32;
 
-            // 4×4 supersampling。
-            //
-            // 一个屏幕像素内部取 16 个采样点，
-            // 根据落入圆内的采样点数量计算 alpha。
+            // 根据像素内 4×4 采样点的覆盖率计算 alpha。
             for sample_y in 0..AA_GRID {
                 let py =
                     y as f32
@@ -443,13 +373,7 @@ unsafe fn render_crosshair(
                 )
                     / 255;
 
-            // little-endian 内存：
-            //
-            // B G R A
-            //
-            // u32 形式：
-            //
-            // 0xAARRGGBB
+            // little-endian BGRA 内存对应 u32 0xAARRGGBB。
             pixels[
                 (
                     y * WINDOW_SIZE
@@ -463,9 +387,7 @@ unsafe fn render_crosshair(
         }
     }
 
-    // --------------------------------------------------------
     // 提交到 layered window
-    // --------------------------------------------------------
 
     let source_point =
         POINT {
@@ -527,15 +449,7 @@ unsafe fn render_crosshair(
             ULW_ALPHA,
         );
 
-    // --------------------------------------------------------
-    // GDI 资源立刻释放
-    // --------------------------------------------------------
-    //
-    // 没有长期 bitmap / DC 缓存，
-    // 常驻内存更小，也不会积累 GDI object。
-    //
-    // 重绘本来就极少发生，
-    // 所以每次临时创建的成本可以忽略。
+    // 立即释放临时 GDI 资源，避免对象泄漏。
 
     SelectObject(
         memory_dc,
@@ -558,9 +472,7 @@ unsafe fn render_crosshair(
 }
 
 
-// ============================================================
 // Window Procedure
-// ============================================================
 
 unsafe extern "system" fn crosshair_wnd_proc(
     hwnd: HWND,
@@ -569,9 +481,7 @@ unsafe extern "system" fn crosshair_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        // ----------------------------------------------------
         // 鼠标穿透
-        // ----------------------------------------------------
 
         WM_NCHITTEST => {
             return LRESULT(
@@ -579,25 +489,13 @@ unsafe extern "system" fn crosshair_wnd_proc(
             );
         }
 
-        // ----------------------------------------------------
-        // Layered Window 自己有透明 alpha
-        // 不让 Windows 擦背景
-        // ----------------------------------------------------
+        // Layered Window 自带 alpha，不让 Windows 擦除背景。
 
         WM_ERASEBKGND => {
             return LRESULT(1);
         }
 
-        // ----------------------------------------------------
-        // 显示模式 / 分辨率发生变化
-        // ----------------------------------------------------
-        //
-        // 重新提交一次：
-        //
-        // - 会重新获取屏幕尺寸
-        // - 会重新定位到真正中心
-        //
-        // 平时不会触发，不增加持续 CPU。
+        // 显示模式变化后重新渲染并定位到新屏幕中心。
 
         WM_DISPLAYCHANGE => {
             let color =
@@ -630,12 +528,9 @@ unsafe extern "system" fn crosshair_wnd_proc(
             return LRESULT(0);
         }
 
-        // ----------------------------------------------------
         // 每 20ms 检查状态
-        // ----------------------------------------------------
 
         WM_TIMER => {
-            // 程序是否真正退出。
             if crate::tray_state::
                 SHOULD_EXIT
                 .load(
@@ -702,10 +597,7 @@ unsafe extern "system" fn crosshair_wnd_proc(
                         Ordering::SeqCst,
                     );
 
-            // -----------------------------------------------
-            // 颜色 / 大小真正发生变化
-            // 才重新计算 80×80 alpha bitmap。
-            // -----------------------------------------------
+            // 仅样式变化时重新计算 alpha bitmap。
 
             let style_changed =
                 current_color
@@ -742,23 +634,15 @@ unsafe extern "system" fn crosshair_wnd_proc(
                 }
             }
 
-            // -----------------------------------------------
-            // 显示 / 隐藏
-            // -----------------------------------------------
-
             if should_show {
                 if !currently_visible {
-                    // 如果这是第一次显示，
-                    // 上面的 style_changed 一定为 true
-                    // （LAST_* 初始是 u32::MAX），
-                    // 所以 bitmap 已经准备好。
-                    ShowWindow(
+                    let _ = ShowWindow(
                         hwnd,
                         SW_SHOWNOACTIVATE,
                     );
                 }
             } else if currently_visible {
-                ShowWindow(
+                let _ = ShowWindow(
                     hwnd,
                     SW_HIDE,
                 );
@@ -766,10 +650,6 @@ unsafe extern "system" fn crosshair_wnd_proc(
 
             return LRESULT(0);
         }
-
-        // ----------------------------------------------------
-        // 窗口销毁
-        // ----------------------------------------------------
 
         WM_DESTROY => {
             PostQuitMessage(0);
@@ -789,23 +669,11 @@ unsafe extern "system" fn crosshair_wnd_proc(
 }
 
 
-// ============================================================
-// 创建准星窗口
-// ============================================================
-
 fn run_crosshair()
     -> windows::core::Result<()>
 {
     unsafe {
-        // ----------------------------------------------------
-        // 只把“准星线程”设为真实 DPI 感知
-        // ----------------------------------------------------
-        //
-        // 不修改整个进程的 DPI 模式，
-        // 所以不会干扰 eframe UI。
-        //
-        // 对高分辨率 / Windows 缩放显示器尤其重要：
-        // 准星定位和 80×80 bitmap 都按真实像素体系工作。
+        // 仅设置当前线程的 DPI 模式，避免影响 eframe UI；准星使用物理像素坐标。
         let _previous_dpi_context =
             SetThreadDpiAwarenessContext(
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -816,10 +684,6 @@ fn run_crosshair()
 
         let class_name =
             w!("SoundLockCrosshairWindow");
-
-        // ----------------------------------------------------
-        // 注册 Win32 Window Class
-        // ----------------------------------------------------
 
         let wc =
             WNDCLASSEXW {
@@ -869,16 +733,8 @@ fn run_crosshair()
             );
         }
 
-        // ----------------------------------------------------
-        // 计算真实屏幕中心
-        // ----------------------------------------------------
-
         let position =
             centered_window_position();
-
-        // ----------------------------------------------------
-        // 创建准星窗口
-        // ----------------------------------------------------
 
         let hwnd =
             CreateWindowExW(
@@ -894,7 +750,7 @@ fn run_crosshair()
                     // 不出现在 Alt+Tab
                     | WS_EX_TOOLWINDOW
 
-                    // 不抢 PUBG 焦点
+                    // 不抢游戏焦点
                     | WS_EX_NOACTIVATE,
 
                 class_name,
@@ -920,12 +776,7 @@ fn run_crosshair()
                 None,
             )?;
 
-        // ----------------------------------------------------
-        // 首次生成抗锯齿 bitmap
-        // ----------------------------------------------------
-        //
-        // 窗口仍保持隐藏。
-        // UI 开启准星时只 ShowWindow，不需要临时再算。
+        // 隐藏状态下预生成 bitmap，首次显示无需临时计算。
 
         let initial_color =
             crate::tray_state::
@@ -959,21 +810,10 @@ fn run_crosshair()
                 Ordering::SeqCst,
             );
 
-        // ----------------------------------------------------
-        // 默认隐藏
-        // ----------------------------------------------------
-
-        ShowWindow(
+        let _ = ShowWindow(
             hwnd,
             SW_HIDE,
         );
-
-        // ----------------------------------------------------
-        // 20ms 状态检查
-        // ----------------------------------------------------
-        //
-        // 50Hz 足够让“按住右键立即隐藏”没有明显迟滞，
-        // 比原来的 10ms / 100Hz 减少一半定时器唤醒。
 
         SetTimer(
             Some(hwnd),
@@ -982,12 +822,7 @@ fn run_crosshair()
             None,
         );
 
-        // ----------------------------------------------------
-        // 独立 Windows 消息循环
-        // ----------------------------------------------------
-        //
-        // 不依赖 eframe。
-        // UI 被彻底关闭后准星仍然继续运行。
+        // 独立消息循环使准星在 eframe UI 关闭后继续运行。
 
         let mut msg =
             MSG::default();
@@ -1003,7 +838,7 @@ fn run_crosshair()
                 .0;
 
             if result > 0 {
-                TranslateMessage(
+                let _ = TranslateMessage(
                     &msg,
                 );
 

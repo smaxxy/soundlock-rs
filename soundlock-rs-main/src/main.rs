@@ -3,7 +3,6 @@
 mod audio;
 mod config;
 mod crosshair;
-mod diagnostics;
 mod setup;
 mod tray_state;
 mod ui;
@@ -28,9 +27,7 @@ pub struct AppState {
     pub is_limiting: bool,
 }
 
-/// ============================================================
 /// 简单 Yes / No 消息框
-/// ============================================================
 
 fn message_box_yes_no(
     title: &str,
@@ -64,9 +61,7 @@ fn message_box_yes_no(
     }
 }
 
-/// ============================================================
 /// 托盘
-/// ============================================================
 
 const WM_TRAYICON: u32 = WM_APP;
 const IDM_EXIT: usize = 1002;
@@ -81,41 +76,33 @@ unsafe extern "system" fn tray_wnd_proc(
 
     match msg {
         WM_TRAYICON => {
-            // 左键点击托盘图标：
-            // 请求重新打开 UI，并结束当前托盘消息循环。
+            // 左键请求重新打开 UI，并结束当前托盘消息循环。
             if lparam.0 as u32 == WM_LBUTTONUP {
                 tray_state::SHOULD_SHOW_UI.store(
                     true,
                     Ordering::SeqCst,
                 );
 
-                // 这里只结束当前主线程中的托盘消息循环。
-                //
-                // WM_QUIT 会被下面的 GetMessageW 消费掉，
-                // 不会在队列里额外残留。
+                // WM_QUIT 只结束托盘循环，并会被下方的 GetMessageW 消费。
                 PostQuitMessage(0);
 
                 return LRESULT(0);
             }
 
-            // 右键点击托盘图标：
-            // 保持原来的“退出”菜单。
+            // 右键显示退出菜单。
             if lparam.0 as u32 == WM_RBUTTONUP {
                 let mut cursor_pos =
                     Default::default();
 
-                // 即使获取鼠标位置失败，
-                // 也不能在 Win32 callback 中 panic。
+                // Win32 callback 内禁止 panic。
                 if GetCursorPos(
                     &mut cursor_pos,
                 )
                 .is_ok()
                 {
-                    SetForegroundWindow(hwnd);
+                    let _ = SetForegroundWindow(hwnd);
 
-                    // 不在 extern "system" 回调中 unwrap。
-                    //
-                    // panic 穿过 FFI 边界是不安全的。
+                    // panic 不得穿过 extern "system" FFI 边界。
                     if let Ok(menu) =
                         CreatePopupMenu()
                     {
@@ -127,7 +114,7 @@ unsafe extern "system" fn tray_wnd_proc(
                         )
                         .ok();
 
-                        TrackPopupMenu(
+                        let _ = TrackPopupMenu(
                             menu,
                             TPM_LEFTALIGN,
                             cursor_pos.x,
@@ -157,8 +144,7 @@ unsafe extern "system" fn tray_wnd_proc(
                     & 0xFFFF;
 
             if cmd == IDM_EXIT {
-                // 只有用户真正点击“退出”，
-                // 才通知整个程序退出。
+                // 仅退出菜单设置整个程序的退出标志。
                 tray_state::SHOULD_EXIT.store(
                     true,
                     Ordering::SeqCst,
@@ -171,10 +157,7 @@ unsafe extern "system" fn tray_wnd_proc(
         }
 
         WM_DESTROY => {
-            // 这里只表示托盘隐藏窗口被销毁。
-            //
-            // 不设置 SHOULD_EXIT，也不要再次 PostQuitMessage。
-            // 左键重新打开 UI 时同样会销毁这个窗口。
+            // 销毁托盘窗口不等于退出程序；重新打开 UI 也会走到这里。
             return LRESULT(0);
         }
 
@@ -223,10 +206,7 @@ fn run_tray_loop() -> TrayAction {
         let class_name =
             w!("SoundLockTrayWindow");
 
-        // app.rc:
-        // 1 ICON "assets/icon.ico"
-        //
-        // 这里继续使用你已经验证生效的 EXE 图标资源 #1。
+        // app.rc 将 assets/icon.ico 编译为资源 #1。
         let icon =
             match LoadIconW(
                 Some(hinstance.into()),
@@ -425,7 +405,7 @@ fn run_tray_loop() -> TrayAction {
                 .0;
 
             if result > 0 {
-                TranslateMessage(&msg);
+                let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             } else if result == 0 {
                 // WM_QUIT 已在这里被消费。
@@ -440,7 +420,7 @@ fn run_tray_loop() -> TrayAction {
 
         // 离开托盘模式：
         // 先删除托盘图标，再销毁隐藏窗口，最后注销窗口类。
-        Shell_NotifyIconW(
+        let _ = Shell_NotifyIconW(
             NIM_DELETE,
             &mut nid,
         )
@@ -475,34 +455,21 @@ fn run_tray_loop() -> TrayAction {
     }
 }
 
-/// ============================================================
 /// Main
-/// ============================================================
 
 fn main() -> Result<(), ()> {
-    // ========================================================
     // Logger
-    // ========================================================
 
     env_logger::Builder::from_env(
         env_logger::Env::default()
             .default_filter_or(
-                "debug",
+                "warn",
             ),
     )
     .init();
 
-    // ========================================================
     // 单实例检查
-    // ========================================================
-    //
-    // 必须尽量靠前。
-    //
-    // 原来的代码是在 VB-Cable 检查 / 安装之后
-    // 才做单实例判断。
-    //
-    // 那会导致第二个进程也可能弹安装提示，
-    // 甚至执行设备设置。
+    // 必须先于 VB-Cable 检查，避免第二个进程弹安装提示或修改设备。
     let instance =
         match single_instance::
             SingleInstance::new(
@@ -522,27 +489,10 @@ fn main() -> Result<(), ()> {
         };
 
     if !instance.is_single() {
-        log::info!(
-            "Sound Lock 已在运行"
-        );
-
         return Ok(());
     }
 
-    // ========================================================
-    // Diagnostics
-    // ========================================================
-    //
-    // Limiter lifetime 统计只在整个应用 Session
-    // 开始时清零一次。
-    //
-    // 以后重建 Limiter / 设备重连时不再清空。
-    diagnostics::reset_limiter_stats();
-    diagnostics::init();
-
-    // ========================================================
     // VB-Cable 安装检查
-    // ========================================================
 
     if !setup::is_vbcable_installed() {
         let user_wants_install =
@@ -579,9 +529,7 @@ fn main() -> Result<(), ()> {
         }
     }
 
-    // ========================================================
     // Window Icon
-    // ========================================================
 
     let icon_image =
         match image::
@@ -614,8 +562,7 @@ fn main() -> Result<(), ()> {
         icon_rgba
             .dimensions();
 
-    // UI 可能反复创建：
-    // IconData 只构造一次，每次 NativeOptions 只 clone Arc。
+    // UI 可反复创建；IconData 只构造一次，NativeOptions clone 共享 Arc。
     let window_icon =
         Arc::new(
             IconData {
@@ -631,9 +578,7 @@ fn main() -> Result<(), ()> {
             },
         );
 
-    // ========================================================
     // App State
-    // ========================================================
 
     let app_state =
         Arc::new(
@@ -642,9 +587,7 @@ fn main() -> Result<(), ()> {
             ),
         );
 
-    // ========================================================
     // Config
-    // ========================================================
 
     let config =
         Config::load()
@@ -663,21 +606,8 @@ fn main() -> Result<(), ()> {
                 },
             );
 
-    // ========================================================
     // 唯一 RuntimeLimiterParams
-    // ========================================================
-    //
-    // 整个进程只创建这一份。
-    //
-    // 后续：
-    //
-    // Main
-    //   │
-    //   └── Arc<RuntimeLimiterParams>
-    //          ├── UI publish()
-    //          └── Audio / Limiter load_if_changed()
-    //
-    // 严禁 UI / Audio 各自 new 一份。
+    // UI publish 与 Audio load_if_changed 必须共享同一个实例。
     let runtime_params = {
         let cfg_guard =
             match config.lock() {
@@ -701,26 +631,14 @@ fn main() -> Result<(), ()> {
         )
     };
 
-    // ========================================================
     // Crosshair
-    // ========================================================
 
     crosshair::
         start_crosshair();
 
-    // ========================================================
     // UI / Tray 生命周期
-    // ========================================================
-    //
-    // 核心原则：
-    //
-    // - eframe UI 和 Win32 Tray 都继续使用主线程；
-    // - 绝不 spawn + join 托盘线程；
-    // - 点 X 后 run_native 返回，UI 资源释放；
-    // - 然后进入托盘消息循环；
-    // - 左键托盘让 run_tray_loop() 返回 ShowUi；
-    // - 回到 loop 顶部重新创建一个新的 eframe UI；
-    // - Audio / Limiter / Ring / RuntimeLimiterParams 不重建。
+    // eframe 和 Win32 Tray 共用主线程。关闭 UI 后进入托盘消息循环，
+    // 托盘左键返回后重建 UI，但复用 Audio、Ring 和 RuntimeLimiterParams。
 
     loop {
         // 每次重新打开 UI，都重新创建 NativeOptions。
@@ -748,7 +666,7 @@ fn main() -> Result<(), ()> {
                             ),
                         ),
 
-                // 明确要求关闭窗口后返回 main。
+                // 关闭窗口后返回 main 进入托盘模式。
                 run_and_return:
                     true,
 
@@ -828,23 +746,13 @@ fn main() -> Result<(), ()> {
             break;
         }
 
-        // ====================================================
         // UI 已关闭 -> 托盘模式
-        // ====================================================
-
-        log::info!(
-            "UI 已关闭，进入系统托盘，限幅继续运行"
-        );
 
         let tray_action =
             run_tray_loop();
 
         match tray_action {
             TrayAction::ShowUi => {
-                log::info!(
-                    "托盘左键点击，重新创建 UI"
-                );
-
                 // 继续下一轮，在同一个主线程重新 run_native。
                 continue;
             }
@@ -871,10 +779,8 @@ fn main() -> Result<(), ()> {
         }
     }
 
-    // ========================================================
     // 最终退出
-    // ========================================================
-    // 无论托盘是正常退出还是创建失败返回，都明确通知后台线程结束。
+    // 无论托盘正常退出还是创建失败，都通知后台线程结束。
     tray_state::SHOULD_EXIT.store(
         true,
         std::sync::atomic::Ordering::SeqCst,
@@ -885,7 +791,5 @@ fn main() -> Result<(), ()> {
     if !audio::wait_for_shutdown(std::time::Duration::from_secs(3)) {
         log::warn!("等待音频线程退出超时，主程序将继续结束");
     }
-
-    log::info!("程序退出");
     Ok(())
 }
