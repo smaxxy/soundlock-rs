@@ -1,31 +1,19 @@
 use cpal::traits::{DeviceTrait, HostTrait};
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use windows::core::PCWSTR;
-use windows::Win32::System::LibraryLoader::{
-    FindResourceW,
-    GetModuleHandleW,
-    LoadResource,
-    LockResource,
-    SizeofResource,
-};
-
-/// app.rc:
+/// Windows CREATE_NO_WINDOW
 ///
-/// 101 RCDATA "assets/VBCABLE_Driver_Pack45.zip"
-const VBCABLE_RESOURCE_ID: usize = 101;
-
-/// Win32 RT_RCDATA = 10
-const RT_RCDATA_ID: usize = 10;
+/// 防止 powershell.exe 弹出黑色控制台窗口。
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 
 // ============================================================
-// VB-Cable 检测
+// VB-Cable 设备名称检测
 // ============================================================
 
 fn is_cable_output_name(name: &str) -> bool {
@@ -34,8 +22,8 @@ fn is_cable_output_name(name: &str) -> bool {
     // 兼容：
     //
     // CABLE Output
-    // CABLE Output (VB-Audio Virtual Cable)
     // CABLE Output via Line
+    // CABLE Output (VB-Audio Virtual Cable)
     //
     name.contains("cable output")
         || (
@@ -49,7 +37,7 @@ fn is_cable_output_name(name: &str) -> bool {
 fn is_cable_input_name(name: &str) -> bool {
     let name = name.to_lowercase();
 
-    // 常见：
+    // 兼容：
     //
     // CABLE Input
     // CABLE Input (VB-Audio Virtual Cable)
@@ -63,20 +51,25 @@ fn is_cable_input_name(name: &str) -> bool {
 }
 
 
+// ============================================================
+// 检测 VB-Cable
+// ============================================================
+
 /// 检测 VB-Cable 是否已经安装。
 ///
-/// Sound Lock 真正需要捕获的是录音端：
+/// Sound Lock 捕获的是录音端：
 ///
-/// CABLE Output / CABLE Output via Line
+/// CABLE Output
+/// CABLE Output via Line
 ///
-/// 同时也检查播放端 CABLE Input，避免某些音频 API
-/// 只枚举到其中一侧时发生误判。
+/// Windows / PUBG 默认播放设备则是：
+///
+/// CABLE Input
 pub fn is_vbcable_installed() -> bool {
     let host = cpal::default_host();
 
     // --------------------------------------------------------
-    // Recording / Capture side
-    // Sound Lock 输入设备需要的就是这一侧。
+    // 先检查 Sound Lock 真正要捕获的输入端
     // --------------------------------------------------------
 
     if let Ok(devices) = host.input_devices() {
@@ -99,8 +92,7 @@ pub fn is_vbcable_installed() -> bool {
     }
 
     // --------------------------------------------------------
-    // Playback side
-    // Windows 默认播放设备要设置成这一侧。
+    // 再检查 Windows 播放端
     // --------------------------------------------------------
 
     if let Ok(devices) = host.output_devices() {
@@ -127,117 +119,85 @@ pub fn is_vbcable_installed() -> bool {
 
 
 // ============================================================
-// 读取 EXE 中内嵌的 ZIP
+// 获取 VB-Cable 安装程序路径
 // ============================================================
 
-fn load_vbcable_zip_resource(
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    unsafe {
-        let module = GetModuleHandleW(None)?;
-
-        // Win32 MAKEINTRESOURCE(101)
-        let resource_name =
-            PCWSTR(VBCABLE_RESOURCE_ID as *const u16);
-
-        // Win32 MAKEINTRESOURCE(RT_RCDATA = 10)
-        let resource_type =
-            PCWSTR(RT_RCDATA_ID as *const u16);
-
-        let resource = FindResourceW(
-            Some(module),
-            resource_name,
-            resource_type,
-        );
-
-        if resource.is_invalid() {
-            return Err(
-                format!(
-                    "Sound Lock.exe 中没有找到 VB-Cable 资源，Resource ID={}",
-                    VBCABLE_RESOURCE_ID
-                )
-                .into(),
-            );
-        }
-
-        let size = SizeofResource(
-            Some(module),
-            resource,
-        );
-
-        if size == 0 {
-            return Err(
-                "VB-Cable ZIP 内嵌资源大小为 0"
-                    .into(),
-            );
-        }
-
-        let loaded = LoadResource(
-            Some(module),
-            resource,
-        )?;
-
-        let ptr = LockResource(
-            loaded,
-        );
-
-        if ptr.is_null() {
-            return Err(
-                "无法读取 Sound Lock.exe 中的 VB-Cable ZIP 数据"
-                    .into(),
-            );
-        }
-
-        let bytes =
-            std::slice::from_raw_parts(
-                ptr as *const u8,
-                size as usize,
-            );
-
-        // 拷贝为 Rust 自己持有的 Vec。
-        Ok(bytes.to_vec())
-    }
-}
-
-
-// ============================================================
-// TEMP
-// ============================================================
-
-fn create_temp_directory(
+/// 当前开发目录：
+///
+/// D:\soundlock\soundlock-rs\soundlock-rs-main\
+/// └─ assets\
+///    └─ VBCABLE\
+///       ├─ VBCABLE_Setup_x64.exe
+///       ├─ *.inf
+///       ├─ *.cat
+///       ├─ *.sys
+///       └─ ...
+///
+/// 优先使用项目根目录 assets\VBCABLE。
+///
+/// 同时兼容以后把 assets 文件夹放到 exe 旁边。
+fn get_installer_path(
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let root =
-        std::env::temp_dir()
-            .join(
-                format!(
-                    "SoundLock_VBCable_{}",
-                    std::process::id()
-                )
-            );
+    // --------------------------------------------------------
+    // 方案 1：
+    // 项目源码根目录\assets\VBCABLE
+    //
+    // 你现在自己开发运行时就是走这个。
+    // --------------------------------------------------------
 
-    // 同一个进程 PID 理论上不会冲突。
-    // 如果之前异常退出留下目录，就先清掉。
-    if root.exists() {
-        let _ =
-            fs::remove_dir_all(
-                &root,
-            );
+    let project_installer =
+        PathBuf::from(
+            env!("CARGO_MANIFEST_DIR")
+        )
+        .join("assets")
+        .join("VBCABLE")
+        .join("VBCABLE_Setup_x64.exe");
+
+    if project_installer.exists() {
+        return Ok(project_installer);
     }
 
-    fs::create_dir_all(
-        &root,
-    )?;
 
-    Ok(root)
+    // --------------------------------------------------------
+    // 方案 2：
+    // exe 所在目录\assets\VBCABLE
+    //
+    // 以后如果把程序复制出去，
+    // 也可以把 assets 一起放到 exe 旁边。
+    // --------------------------------------------------------
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let portable_installer =
+                exe_dir
+                    .join("assets")
+                    .join("VBCABLE")
+                    .join("VBCABLE_Setup_x64.exe");
+
+            if portable_installer.exists() {
+                return Ok(portable_installer);
+            }
+        }
+    }
+
+
+    Err(
+        format!(
+            "找不到 VB-Cable 安装程序。\n\n\
+             请确认完整驱动文件夹位于：\n\
+             {}",
+            project_installer.display()
+        )
+        .into(),
+    )
 }
 
 
 // ============================================================
-// PowerShell Quote
+// PowerShell 字符串转义
 // ============================================================
 
-fn ps_quote(
-    value: &str,
-) -> String {
+fn ps_quote(value: &str) -> String {
     value.replace(
         '\'',
         "''",
@@ -246,130 +206,7 @@ fn ps_quote(
 
 
 // ============================================================
-// 解压 ZIP
-// ============================================================
-
-fn extract_zip(
-    zip_path: &Path,
-    destination: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(
-        destination,
-    )?;
-
-    let zip =
-        ps_quote(
-            &zip_path
-                .to_string_lossy(),
-        );
-
-    let destination =
-        ps_quote(
-            &destination
-                .to_string_lossy(),
-        );
-
-    let script =
-        format!(
-            r#"
-$ErrorActionPreference = 'Stop'
-
-Expand-Archive `
-    -LiteralPath '{zip}' `
-    -DestinationPath '{destination}' `
-    -Force
-"#
-        );
-
-    let output =
-        Command::new(
-            "powershell.exe",
-        )
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .output()?;
-
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr =
-            String::from_utf8_lossy(
-                &output.stderr,
-            );
-
-        Err(
-            format!(
-                "解压 VB-Cable 驱动包失败: {}",
-                stderr.trim()
-            )
-            .into(),
-        )
-    }
-}
-
-
-// ============================================================
-// 递归寻找安装程序
-// ============================================================
-
-fn find_file_recursive(
-    directory: &Path,
-    target_name: &str,
-) -> std::io::Result<Option<PathBuf>> {
-    if !directory.is_dir() {
-        return Ok(None);
-    }
-
-    for entry in fs::read_dir(
-        directory,
-    )? {
-        let entry =
-            entry?;
-
-        let path =
-            entry.path();
-
-        if path.is_dir() {
-            if let Some(found) =
-                find_file_recursive(
-                    &path,
-                    target_name,
-                )?
-            {
-                return Ok(
-                    Some(found),
-                );
-            }
-
-            continue;
-        }
-
-        let Some(name) =
-            path.file_name()
-                .and_then(|v| v.to_str())
-        else {
-            continue;
-        };
-
-        if name.eq_ignore_ascii_case(
-            target_name,
-        ) {
-            return Ok(
-                Some(path),
-            );
-        }
-    }
-
-    Ok(None)
-}
-
-
-// ============================================================
-// 等待设备注册
+// 等待 Windows 注册 VB-Cable 音频端点
 // ============================================================
 
 fn wait_for_vbcable(
@@ -390,8 +227,7 @@ fn wait_for_vbcable(
             interval,
         );
 
-        elapsed +=
-            interval;
+        elapsed += interval;
     }
 
     false
@@ -399,101 +235,25 @@ fn wait_for_vbcable(
 
 
 // ============================================================
-// 安装
+// 安装 VB-Cable
 // ============================================================
 
-/// 从 Sound Lock.exe 中：
+/// 直接使用 assets\VBCABLE 中完整解压后的官方驱动包。
 ///
-/// 1. 提取完整 VBCABLE_Driver_Pack45.zip
-/// 2. 解压所有文件
-/// 3. 递归寻找 VBCABLE_Setup_x64.exe
-/// 4. 管理员权限运行安装程序
-/// 5. 等待设备注册
-/// 6. 删除临时文件
+/// 不再：
+///
+/// - 读取 EXE Resource
+/// - 写 ZIP
+/// - Expand-Archive
+/// - TEMP 解压
+///
+/// PowerShell 自身隐藏运行，不会弹黑色控制台。
+///
+/// UAC 管理员权限确认仍会正常弹出。
 pub fn install_vbcable(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let root =
-        create_temp_directory()?;
-
-    let result =
-        install_vbcable_inner(
-            &root,
-        );
-
-    // 安装程序已经结束以后即可清理。
-    //
-    // 清理失败不应该覆盖真正的安装结果。
-    if let Err(e) =
-        fs::remove_dir_all(
-            &root,
-        )
-    {
-        log::warn!(
-            "清理 VB-Cable 临时目录失败 {}: {}",
-            root.display(),
-            e
-        );
-    }
-
-    result
-}
-
-
-fn install_vbcable_inner(
-    root: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // --------------------------------------------------------
-    // 提取内嵌 ZIP
-    // --------------------------------------------------------
-
-    let zip_bytes =
-        load_vbcable_zip_resource()?;
-
-    let zip_path =
-        root.join(
-            "VBCABLE_Driver_Pack45.zip",
-        );
-
-    fs::write(
-        &zip_path,
-        zip_bytes,
-    )?;
-
-
-    // --------------------------------------------------------
-    // 完整解压
-    // --------------------------------------------------------
-
-    let extracted =
-        root.join(
-            "package",
-        );
-
-    extract_zip(
-        &zip_path,
-        &extracted,
-    )?;
-
-
-    // --------------------------------------------------------
-    // 找 VBCABLE_Setup_x64.exe
-    //
-    // 不假设 ZIP 根目录结构。
-    // --------------------------------------------------------
-
     let installer =
-        find_file_recursive(
-            &extracted,
-            "VBCABLE_Setup_x64.exe",
-        )?
-        .ok_or_else(
-            || {
-                format!(
-                    "VB-Cable 驱动包中没有找到 VBCABLE_Setup_x64.exe，解压目录：{}",
-                    extracted.display()
-                )
-            },
-        )?;
+        get_installer_path()?;
 
 
     log::info!(
@@ -502,10 +262,6 @@ fn install_vbcable_inner(
     );
 
 
-    // --------------------------------------------------------
-    // 管理员安装
-    // --------------------------------------------------------
-
     let installer_ps =
         ps_quote(
             &installer
@@ -513,14 +269,16 @@ fn install_vbcable_inner(
         );
 
 
-    // 保留你原来使用的 /S 参数。
+    // --------------------------------------------------------
+    // 管理员权限启动官方安装程序
+    // --------------------------------------------------------
     //
-    // 注意：
-    // VB-Audio 官方文档主要描述的是 GUI 安装流程，
-    // 并没有在公开安装说明中明确保证 /S。
+    // 目前保留你之前已经使用成功的 /S。
     //
-    // 如果你实际使用的 Pack45 安装程序不接受 /S，
-    // 这里删除 -ArgumentList '/S' 即可。
+    // PowerShell 本身使用 CREATE_NO_WINDOW，
+    // 所以不会再看到黑色 PowerShell 窗口。
+    // --------------------------------------------------------
+
     let script =
         format!(
             r#"
@@ -535,7 +293,7 @@ $process = Start-Process `
 
 if ($process.ExitCode -ne 0)
 {{
-    exit $process.ExitCode
+    throw "VB-Cable installer exit code: $($process.ExitCode)"
 }}
 
 exit 0
@@ -548,14 +306,25 @@ exit 0
             "powershell.exe",
         )
         .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-WindowStyle")
+        .arg("Hidden")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-Command")
         .arg(script)
+        .creation_flags(
+            CREATE_NO_WINDOW,
+        )
         .output()?;
 
 
     if !output.status.success() {
+        let stdout =
+            String::from_utf8_lossy(
+                &output.stdout,
+            );
+
         let stderr =
             String::from_utf8_lossy(
                 &output.stderr,
@@ -563,9 +332,13 @@ exit 0
 
         return Err(
             format!(
-                "VB-Cable 安装程序执行失败，ExitCode={:?}，错误：{}",
+                "VB-Cable 安装失败。\n\
+                 ExitCode: {:?}\n\
+                 stdout: {}\n\
+                 stderr: {}",
                 output.status.code(),
-                stderr.trim()
+                stdout.trim(),
+                stderr.trim(),
             )
             .into(),
         );
@@ -573,23 +346,22 @@ exit 0
 
 
     // --------------------------------------------------------
-    // 等待 Windows 注册音频端点
+    // 安装结束后等待 Windows 注册音频设备
     // --------------------------------------------------------
 
     if wait_for_vbcable(
         Duration::from_secs(10),
     ) {
         log::info!(
-            "VB-Cable 已安装并检测到音频端点"
+            "VB-Cable 安装完成，并已检测到音频端点"
         );
     } else {
-        // 官方明确建议安装后重启 Windows。
-        //
-        // 所以这里不把它当成“安装器失败”。
         log::warn!(
-            "VB-Cable 安装程序已完成，但当前尚未检测到 CABLE Input / CABLE Output；可能需要重启 Windows"
+            "VB-Cable 安装程序已经完成，但当前尚未检测到 \
+             CABLE Input / CABLE Output；可能需要重新启动 Windows"
         );
     }
+
 
     Ok(())
 }
@@ -599,13 +371,17 @@ exit 0
 // 设置 Windows 默认播放设备
 // ============================================================
 
-/// Windows/PUBG 默认播放设备应设置为：
+/// 将 Windows 默认播放设备设置成名称包含 keyword 的设备。
 ///
-/// CABLE Input
+/// 你的 main.rs 继续使用：
 ///
-/// Sound Lock 自己捕获的是另一侧：
+/// setup::set_default_playback_device("CABLE Input")
 ///
-/// CABLE Output / CABLE Output via Line
+/// 注意：
+///
+/// Windows / PUBG 输出：CABLE Input
+///
+/// Sound Lock 捕获输入：CABLE Output via Line
 pub fn set_default_playback_device(
     keyword: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -614,6 +390,7 @@ pub fn set_default_playback_device(
             '\'',
             "''",
         );
+
 
     let ps_script =
         format!(
@@ -711,8 +488,7 @@ $devices =
         1
     )
 
-$found =
-    $false
+$found = $false
 
 foreach ($dev in $devices)
 {{
@@ -737,8 +513,7 @@ foreach ($dev in $devices)
             throw "SetDefaultEndpoint failed: $result"
         }}
 
-        $found =
-            $true
+        $found = $true
 
         break
     }}
@@ -758,16 +533,27 @@ if (-not $found)
             "powershell.exe",
         )
         .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-WindowStyle")
+        .arg("Hidden")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-Command")
         .arg(ps_script)
+        .creation_flags(
+            CREATE_NO_WINDOW,
+        )
         .output()?;
 
 
     if output.status.success() {
         Ok(())
     } else {
+        let stdout =
+            String::from_utf8_lossy(
+                &output.stdout,
+            );
+
         let stderr =
             String::from_utf8_lossy(
                 &output.stderr,
@@ -775,7 +561,10 @@ if (-not $found)
 
         Err(
             format!(
-                "设置默认播放设备失败: {}",
+                "设置默认播放设备失败。\n\
+                 stdout: {}\n\
+                 stderr: {}",
+                stdout.trim(),
                 stderr.trim()
             )
             .into(),
