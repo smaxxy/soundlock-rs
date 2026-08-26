@@ -12,6 +12,9 @@ const DEFAULT_ATTACK_MS: u32 = 10;
 const DEFAULT_RELEASE_MS: u32 = 50;
 const DEFAULT_PRE_GAIN_DB: f32 = 6.0;
 const DEFAULT_PEAK_RELEASE_MS: u32 = 50;
+const DEFAULT_CROSSHAIR_ENABLED: bool = false;
+const DEFAULT_CROSSHAIR_COLOR: u32 = 0x0078FF;
+const DEFAULT_CROSSHAIR_SIZE: u32 = 18;
 
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
@@ -26,6 +29,9 @@ pub struct Config {
     pub peak_release_ms: u32,
     pub target_input_device_id: Option<String>,
     pub target_output_device_id: Option<String>,
+    pub crosshair_enabled: bool,
+    pub crosshair_color: u32,
+    pub crosshair_size: u32,
 }
 
 impl Default for Config {
@@ -38,6 +44,9 @@ impl Default for Config {
             peak_release_ms: DEFAULT_PEAK_RELEASE_MS,
             target_input_device_id: None,
             target_output_device_id: None,
+            crosshair_enabled: DEFAULT_CROSSHAIR_ENABLED,
+            crosshair_color: DEFAULT_CROSSHAIR_COLOR,
+            crosshair_size: DEFAULT_CROSSHAIR_SIZE,
         }
     }
 }
@@ -166,10 +175,7 @@ impl RuntimeLimiterParams {
     /// 如果正好撞上写端，直接返回 None，下一次 callback 再读取；
     /// 不在实时线程里 spin。
     #[inline]
-    pub fn load_if_changed(
-        &self,
-        last_version: &mut u64,
-    ) -> Option<LimiterParams> {
+    pub fn load_if_changed(&self, last_version: &mut u64) -> Option<LimiterParams> {
         let version_before = self.parameter_version.load(Ordering::Acquire);
 
         if version_before & 1 != 0 || version_before == *last_version {
@@ -217,14 +223,10 @@ impl RuntimeLimiterParams {
     #[inline]
     fn load_relaxed(&self) -> LimiterParams {
         LimiterParams {
-            threshold_db: f32::from_bits(
-                self.threshold_db_bits.load(Ordering::Relaxed),
-            ),
+            threshold_db: f32::from_bits(self.threshold_db_bits.load(Ordering::Relaxed)),
             attack_ms: self.attack_ms.load(Ordering::Relaxed),
             release_ms: self.release_ms.load(Ordering::Relaxed),
-            pre_gain_db: f32::from_bits(
-                self.pre_gain_db_bits.load(Ordering::Relaxed),
-            ),
+            pre_gain_db: f32::from_bits(self.pre_gain_db_bits.load(Ordering::Relaxed)),
             peak_release_ms: self.peak_release_ms.load(Ordering::Relaxed),
         }
     }
@@ -257,11 +259,7 @@ impl Config {
                 // 这样不会因为一个坏 TOML 导致整个程序无法打开。
                 match backup_malformed_config(&path) {
                     Ok(backup) => {
-                        log::error!(
-                            "配置文件解析失败，已备份到 {}: {}",
-                            backup.display(),
-                            error
-                        );
+                        log::error!("配置文件解析失败，已备份到 {}: {}", backup.display(), error);
                     }
                     Err(backup_error) => {
                         log::error!(
@@ -332,6 +330,8 @@ impl Config {
         self.release_ms = params.release_ms;
         self.pre_gain_db = params.pre_gain_db;
         self.peak_release_ms = params.peak_release_ms;
+        self.crosshair_color &= 0x00FF_FFFF;
+        self.crosshair_size = self.crosshair_size.clamp(4, 60);
     }
 }
 
@@ -363,9 +363,7 @@ fn backup_malformed_config(path: &Path) -> io::Result<PathBuf> {
 
     while backup.exists() {
         suffix += 1;
-        backup = path.with_file_name(format!(
-            "{file_name}.corrupt-{timestamp}-{suffix}"
-        ));
+        backup = path.with_file_name(format!("{file_name}.corrupt-{timestamp}-{suffix}"));
     }
 
     // 优先 rename：原损坏文件不再在下次启动时反复触发解析失败。
@@ -383,9 +381,7 @@ fn backup_malformed_config(path: &Path) -> io::Result<PathBuf> {
                 .map_err(|copy_error| {
                     io::Error::new(
                         copy_error.kind(),
-                        format!(
-                            "rename failed: {rename_error}; copy failed: {copy_error}"
-                        ),
+                        format!("rename failed: {rename_error}; copy failed: {copy_error}"),
                     )
                 })
         }
@@ -484,5 +480,37 @@ mod tests {
 
         // 没有新 publish 时不应重复返回参数。
         assert!(runtime.load_if_changed(&mut version).is_none());
+    }
+
+    #[test]
+    fn old_config_without_crosshair_fields_uses_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+threshold_db = -18.0
+attack_ms = 12
+release_ms = 60
+pre_gain_db = 4.0
+peak_release_ms = 55
+"#,
+        )
+        .expect("deserialize old config");
+
+        assert!(!config.crosshair_enabled);
+        assert_eq!(config.crosshair_color, DEFAULT_CROSSHAIR_COLOR);
+        assert_eq!(config.crosshair_size, DEFAULT_CROSSHAIR_SIZE);
+    }
+
+    #[test]
+    fn crosshair_settings_are_sanitized() {
+        let mut config = Config {
+            crosshair_color: 0xFFFF_FFFF,
+            crosshair_size: 999,
+            ..Config::default()
+        };
+
+        config.sanitize();
+
+        assert_eq!(config.crosshair_color, 0x00FF_FFFF);
+        assert_eq!(config.crosshair_size, 60);
     }
 }

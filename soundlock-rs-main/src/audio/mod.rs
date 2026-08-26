@@ -1,5 +1,4 @@
 pub mod limiter;
-pub mod recorder;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
@@ -378,15 +377,6 @@ fn run_limiter_session(
 
     let sample_rate = stream_config.sample_rate as f32;
 
-    // 原始录音使用独立的预分配 SPSC Ring Buffer。
-    // Producer 随 Input Callback 移动，Consumer 由普通后台线程写 WAV。
-    // 录音数据取自 Limiter 之前，用户实际听到的输出仍经过现有限幅保护。
-    let recorder_pair = recorder::start_session(stream_config.sample_rate);
-    let (mut raw_recorder, recorder_session) = match recorder_pair {
-        Some((realtime, session)) => (Some(realtime), Some(session)),
-        None => (None, None),
-    };
-
     // Limiter 被 move 进 Input Callback，整个 Session 中只有这一位 owner。
     let mut limiter = LoudnessLimiter::new(runtime_params);
     limiter.set_sample_rate(sample_rate);
@@ -445,24 +435,9 @@ fn run_limiter_session(
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         limiter.begin_audio_callback();
 
-        // 每个 callback 只读取一次录音开关。
-        // active-callback 计数保证停止时不会在尚有旧 callback 推送数据时封口 WAV。
-        let recorder_callback = recorder::begin_input_callback();
-        let record_raw_audio = recorder_callback.is_recording();
-        let mut recorder_dropped_frames = 0u64;
-
         let mut index = 0usize;
 
         while index + 1 < data.len() {
-            if record_raw_audio {
-                if let Some(recorder) = raw_recorder.as_mut() {
-                    if !recorder.try_push(data[index], data[index + 1]) {
-                        recorder_dropped_frames =
-                            recorder_dropped_frames.saturating_add(1);
-                    }
-                }
-            }
-
             let (mut left, mut right) =
                 limiter.process_stereo_frame(data[index], data[index + 1]);
 
@@ -479,7 +454,6 @@ fn run_limiter_session(
         }
 
         // 奇数 remainder sample 故意丢弃，绝不破坏 L/R frame 对齐。
-        recorder::add_dropped_frames(recorder_dropped_frames);
     };
 
     // Output Callback
@@ -789,11 +763,6 @@ fn run_limiter_session(
             reason: format!("failed to start output stream: {error}"),
             ran_for: Duration::ZERO,
         };
-    }
-
-    // 只有输入/输出 Stream 都真正启动后，UI 才允许开始原始录音。
-    if let Some(session) = recorder_session.as_ref() {
-        session.mark_available();
     }
 
     let started_at = Instant::now();

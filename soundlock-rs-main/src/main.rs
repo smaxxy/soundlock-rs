@@ -10,9 +10,6 @@ mod ui;
 use crate::config::{Config, RuntimeLimiterParams};
 use crate::ui::SettingsWindow;
 
-use eframe::egui;
-use egui::IconData;
-
 use std::sync::{Arc, Mutex};
 
 use windows::core::{w, PCWSTR};
@@ -529,55 +526,6 @@ fn main() -> Result<(), ()> {
         }
     }
 
-    // Window Icon
-
-    let icon_image =
-        match image::
-            load_from_memory(
-                include_bytes!(
-                    "../assets/icon.png"
-                ),
-            )
-        {
-            Ok(image) => image,
-
-            Err(e) => {
-                log::error!(
-                    "图标加载失败: {}",
-                    e
-                );
-
-                return Err(());
-            }
-        };
-
-    let icon_rgba =
-        icon_image
-            .to_rgba8();
-
-    let (
-        icon_width,
-        icon_height,
-    ) =
-        icon_rgba
-            .dimensions();
-
-    // UI 可反复创建；IconData 只构造一次，NativeOptions clone 共享 Arc。
-    let window_icon =
-        Arc::new(
-            IconData {
-                rgba:
-                    icon_rgba
-                        .into_raw(),
-
-                width:
-                    icon_width,
-
-                height:
-                    icon_height,
-            },
-        );
-
     // App State
 
     let app_state =
@@ -605,6 +553,32 @@ fn main() -> Result<(), ()> {
                     )
                 },
             );
+
+    // 将持久化的准星设置发布到准星线程使用的无锁状态。
+    {
+        let cfg_guard = match config.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!(
+                    "Config mutex poisoned while restoring crosshair settings; using recovered value"
+                );
+                poisoned.into_inner()
+            }
+        };
+
+        tray_state::CROSSHAIR_ENABLED.store(
+            cfg_guard.crosshair_enabled,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        tray_state::CROSSHAIR_COLOR.store(
+            cfg_guard.crosshair_color & 0x00FF_FFFF,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        tray_state::CROSSHAIR_SIZE.store(
+            cfg_guard.crosshair_size.clamp(4, 60),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
 
     // 唯一 RuntimeLimiterParams
     // UI publish 与 Audio load_if_changed 必须共享同一个实例。
@@ -637,42 +611,10 @@ fn main() -> Result<(), ()> {
         start_crosshair();
 
     // UI / Tray 生命周期
-    // eframe 和 Win32 Tray 共用主线程。关闭 UI 后进入托盘消息循环，
+    // 原生 Win32 UI 和 Tray 共用主线程。关闭 UI 后进入托盘消息循环，
     // 托盘左键返回后重建 UI，但复用 Audio、Ring 和 RuntimeLimiterParams。
 
     loop {
-        // 每次重新打开 UI，都重新创建 NativeOptions。
-        let native_options =
-            eframe::NativeOptions {
-                viewport:
-                    egui::
-                        ViewportBuilder::
-                        default()
-                        .with_inner_size(
-                            [
-                                400.0,
-                                550.0,
-                            ],
-                        )
-                        .with_min_inner_size(
-                            [
-                                300.0,
-                                400.0,
-                            ],
-                        )
-                        .with_icon(
-                            Arc::clone(
-                                &window_icon,
-                            ),
-                        ),
-
-                // 关闭窗口后返回 main 进入托盘模式。
-                run_and_return:
-                    true,
-
-                ..Default::default()
-            };
-
         // move 闭包只拿本轮 UI 的 Arc clone。
         let ui_app_state =
             Arc::clone(
@@ -689,33 +631,11 @@ fn main() -> Result<(), ()> {
                 &runtime_params,
             );
 
-        let run_result =
-            eframe::run_native(
-                "Sound Lock Rust",
-                native_options,
-
-                Box::new(
-                    move |_| {
-                        Ok(
-                            Box::new(
-                                SettingsWindow::new(
-                                    Arc::clone(
-                                        &ui_app_state,
-                                    ),
-
-                                    Arc::clone(
-                                        &ui_config,
-                                    ),
-
-                                    Arc::clone(
-                                        &ui_runtime_params,
-                                    ),
-                                ),
-                            ),
-                        )
-                    },
-                ),
-            );
+        let run_result = ui::run_settings_window(SettingsWindow::new(
+            ui_app_state,
+            ui_config,
+            ui_runtime_params,
+        ));
 
         if let Err(e) =
             run_result
@@ -753,7 +673,7 @@ fn main() -> Result<(), ()> {
 
         match tray_action {
             TrayAction::ShowUi => {
-                // 继续下一轮，在同一个主线程重新 run_native。
+                // 继续下一轮，在同一个主线程重建原生设置窗口。
                 continue;
             }
 
