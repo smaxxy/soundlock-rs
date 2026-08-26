@@ -1,1 +1,4 @@
 1 ICON "assets/icon.ico"
+1 24 "app.manifest"
+
+101 RCDATA "assets/VBCABLE_Driver_Pack45.zip"

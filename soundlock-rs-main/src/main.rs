@@ -637,25 +637,15 @@ fn main() -> Result<(), ()> {
             ui_runtime_params,
         ));
 
-        if let Err(e) =
-            run_result
-        {
-            log::error!(
-                "无法创建或运行窗口: {}",
-                e
-            );
+       if let Err(e) = run_result {
+    log::error!(
+        "设置窗口创建或运行失败: {}，将保留音频并进入托盘模式",
+        e
+    );
 
-            tray_state::SHOULD_EXIT
-                .store(
-                    true,
-                    std::sync::
-                        atomic::
-                        Ordering::SeqCst,
-                );
-
-            break;
-        }
-
+    // UI 失败不应杀死正在正常工作的 Audio。
+    // 直接进入托盘，让用户仍然可以退出或再次尝试打开 UI。
+}
         if tray_state::SHOULD_EXIT
             .load(
                 std::sync::
