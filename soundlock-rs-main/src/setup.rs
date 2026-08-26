@@ -248,8 +248,6 @@ fn wait_for_vbcable(
 /// - TEMP 解压
 ///
 /// PowerShell 自身隐藏运行，不会弹黑色控制台。
-///
-/// UAC 管理员权限确认仍会正常弹出。
 pub fn install_vbcable(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let installer =
@@ -270,13 +268,10 @@ pub fn install_vbcable(
 
 
     // --------------------------------------------------------
-    // 管理员权限启动官方安装程序
-    // --------------------------------------------------------
+    // 只负责启动安装器，不再 -Wait。
     //
-    // 目前保留你之前已经使用成功的 /S。
-    //
-    // PowerShell 本身使用 CREATE_NO_WINDOW，
-    // 所以不会再看到黑色 PowerShell 窗口。
+    // 否则 VB-Cable 安装器残留的子进程可能导致
+    // PowerShell 一直等待，从而阻塞 Sound Lock UI 启动。
     // --------------------------------------------------------
 
     let script =
@@ -284,17 +279,10 @@ pub fn install_vbcable(
             r#"
 $ErrorActionPreference = 'Stop'
 
-$process = Start-Process `
+Start-Process `
     -FilePath '{installer_ps}' `
     -ArgumentList '/S' `
-    -Verb RunAs `
-    -Wait `
-    -PassThru
-
-if ($process.ExitCode -ne 0)
-{{
-    throw "VB-Cable installer exit code: $($process.ExitCode)"
-}}
+    -Verb RunAs
 
 exit 0
 "#
@@ -332,7 +320,7 @@ exit 0
 
         return Err(
             format!(
-                "VB-Cable 安装失败。\n\
+                "无法启动 VB-Cable 安装程序。\n\
                  ExitCode: {:?}\n\
                  stdout: {}\n\
                  stderr: {}",
@@ -346,27 +334,31 @@ exit 0
 
 
     // --------------------------------------------------------
-    // 安装结束后等待 Windows 注册音频设备
+    // 不等安装器进程。
+    //
+    // 我们自己等待 Windows 真正出现 VB-Cable 音频端点。
     // --------------------------------------------------------
 
     if wait_for_vbcable(
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     ) {
         log::info!(
             "VB-Cable 安装完成，并已检测到音频端点"
         );
     } else {
+        // 即使 60 秒没检测到，也不要卡死 Sound Lock。
+        // 某些机器安装驱动后需要重启才能出现设备。
         log::warn!(
-            "VB-Cable 安装程序已经完成，但当前尚未检测到 \
-             CABLE Input / CABLE Output；可能需要重新启动 Windows"
+            "60 秒内未检测到 VB-Cable 音频端点；\
+             安装可能需要重新启动 Windows"
         );
     }
 
 
+    // 无论有没有检测到设备，
+    // 都返回 main，让 Sound Lock UI 能继续启动。
     Ok(())
 }
-
-
 // ============================================================
 // 设置 Windows 默认播放设备
 // ============================================================
