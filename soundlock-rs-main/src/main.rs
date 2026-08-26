@@ -58,6 +58,27 @@ fn message_box_yes_no(
     }
 }
 
+/// 打开 VB-CABLE 官方网站。
+///
+/// 使用 Windows ShellExecuteW 调用系统默认浏览器。
+fn open_vbcable_website() {
+    unsafe {
+        let result = ShellExecuteW(
+            None,
+            w!("open"),
+            w!("https://vb-audio.com/Cable/index.htm"),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+
+        // ShellExecuteW 返回值 <= 32 表示打开失败。
+        if result.0 as isize <= 32 {
+            log::error!("无法打开 VB-CABLE 官网");
+        }
+    }
+}
+
 /// 托盘
 
 const WM_TRAYICON: u32 = WM_APP;
@@ -489,44 +510,45 @@ fn main() -> Result<(), ()> {
         return Ok(());
     }
 
-    // VB-Cable 安装检查
+    // VB-Cable 检查
+    //
+    // Sound Lock 依赖 VB-CABLE。
+    // 如果未检测到，不再尝试自动安装或修改系统默认播放设备；
+    // 只提示用户前往官方下载，随后结束本次启动。
 
-    if !setup::is_vbcable_installed() {
-        let user_wants_install =
-            message_box_yes_no(
-                "虚拟声卡未安装",
-                "Sound Lock 需要虚拟声卡 VB-Cable 才能工作。\n\n是否立即安装？（需要管理员权限）",
-            );
+   // ============================================================
+// 虚拟声卡提示
+// ============================================================
+//
+// Sound Lock 并不强制要求 VB-CABLE。
+// 其他能够完成虚拟音频路由的设备也可以使用。
+//
+// 如果没有检测到 VB-CABLE，只做推荐提示，
+// 不阻止用户进入 Sound Lock。
+// ============================================================
 
-        if user_wants_install {
-            match setup::
-                install_vbcable()
-            {
-                Ok(()) => {
-                    if let Err(e) =
-                        setup::
-                            set_default_playback_device(
-                                "CABLE Input",
-                            )
-                    {
-                        log::error!(
-                            "设置默认播放设备失败: {}",
-                            e
-                        );
-                    }
-                }
+if !setup::is_vbcable_installed() {
+    let open_website =
+        message_box_yes_no(
+            "虚拟声卡提示",
+            "Sound Lock 需要配合虚拟声卡使用。\n\n\
+             如果您已经安装其他可用的虚拟声卡，请忽略此提示。\n\n\
+             推荐使用 VB-CABLE，是否前往 VB-CABLE 官方网站下载？\n\n\
+             使用 VB-CABLE 时：\n\
+             输入设备请选择 CABLE Output，\
+             输出设备请选择您实际使用的耳机或音频设备。",
+        );
 
-                Err(e) => {
-                    log::error!(
-                        "VB-Cable 安装失败: {}",
-                        e
-                    );
-                }
-            }
-        }
+    if open_website {
+        open_vbcable_website();
     }
 
-    // App State
+    // 注意：
+    // 无论用户选择“是”还是“否”，
+    // 都不要 return。
+    //
+    // 继续向下执行，正常打开 Sound Lock UI。
+}
 
     let app_state =
         Arc::new(
