@@ -567,7 +567,7 @@ fn main() -> Result<(), ()> {
         };
 
         tray_state::CROSSHAIR_ENABLED.store(
-            cfg_guard.crosshair_enabled,
+           false,
             std::sync::atomic::Ordering::SeqCst,
         );
         tray_state::CROSSHAIR_COLOR.store(

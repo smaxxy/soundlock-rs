@@ -1435,13 +1435,9 @@ impl SettingsWindow {
         }
 
 
-        cfg.crosshair_enabled =
-            crate::tray_state::
-                CROSSHAIR_ENABLED
-                .load(
-                    Ordering::SeqCst,
-                );
-
+        // 准星开启状态不持久化。
+// 每次重新启动 Sound Lock 都默认关闭。
+cfg.crosshair_enabled = false;
         cfg.crosshair_color =
             crate::tray_state::
                 CROSSHAIR_COLOR
