@@ -29,6 +29,7 @@ use windows::core::{
 };
 
 use windows::Win32::Foundation::{
+    COLORREF,
     HWND,
     LPARAM,
     LRESULT,
@@ -51,6 +52,10 @@ use windows::Win32::Graphics::Gdi::{
     HFONT,
     HGDIOBJ,
     OUT_DEFAULT_PRECIS,
+    SetBkMode,
+GetSysColorBrush,
+TRANSPARENT,
+ HDC,
 };
 
 use windows::Win32::System::LibraryLoader::
@@ -76,6 +81,13 @@ use windows::Win32::UI::Controls::{
     WC_COMBOBOXW,
     WC_EDITW,
     WC_STATICW,
+};
+
+use windows::Win32::UI::Controls::Dialogs::{
+    ChooseColorW,
+    CHOOSECOLORW,
+    CC_FULLOPEN,
+    CC_RGBINIT,
 };
 
 use windows::Win32::UI::Input::KeyboardAndMouse::
@@ -151,7 +163,7 @@ pub struct SettingsWindow {
 
     output_devices:
         Vec<(Device, String)>,
-
+custom_colors: [COLORREF; 16],
     // --------------------------------------------------------
     // 异步设备枚举
     // --------------------------------------------------------
@@ -189,6 +201,7 @@ impl SettingsWindow {
             Arc<RuntimeLimiterParams>,
     ) -> Self {
         Self {
+            custom_colors: [COLORREF(0); 16],
             state,
             config,
             runtime_params,
@@ -376,7 +389,7 @@ impl SettingsWindow {
                 SS_ETCHEDHORZ.0,
             ),
             18,
-            0,
+            20,
             406,
             2,
             0,
@@ -388,23 +401,7 @@ impl SettingsWindow {
         // 音频设备
         // ====================================================
 
-        child(
-            self.hwnd,
-            WC_BUTTON,
-            "刷新设备",
-            WINDOW_STYLE(
-                BS_PUSHBUTTON
-                    as u32,
-            )
-                | WS_TABSTOP,
-            320,
-            9,
-            82,
-            30,
-            ID_REFRESH,
-            self.font,
-        );
-
+       
         label(
             self.hwnd,
             "输入设备",
@@ -460,6 +457,22 @@ impl SettingsWindow {
             ID_OUTPUT,
             self.font,
         );
+ child(
+            self.hwnd,
+            WC_BUTTON,
+            "刷新设备",
+            WINDOW_STYLE(
+                BS_PUSHBUTTON
+                    as u32,
+            )
+                | WS_TABSTOP,
+            320,
+            97,
+            82,
+            30,
+            ID_REFRESH,
+            self.font,
+        );
 
 
         // ====================================================
@@ -468,11 +481,11 @@ impl SettingsWindow {
 
         group_box(
             self.hwnd,
-            "Limiter 参数",
+            "",
             18,
             142,
             406,
-            206,
+            256,
             self.font,
         );
 
@@ -490,7 +503,7 @@ impl SettingsWindow {
             "RMS 触发",
             ID_ATTACK,
             ID_ATTACK_VALUE,
-            202,
+            212,
             self.font,
         );
 
@@ -499,7 +512,7 @@ impl SettingsWindow {
             "RMS 释放",
             ID_RELEASE,
             ID_RELEASE_VALUE,
-            237,
+            257,
             self.font,
         );
 
@@ -508,7 +521,7 @@ impl SettingsWindow {
             "Pre-Gain",
             ID_PRE_GAIN,
             ID_PRE_GAIN_VALUE,
-            272,
+            302,
             self.font,
         );
 
@@ -517,7 +530,7 @@ impl SettingsWindow {
             "Peak 释放",
             ID_PEAK_RELEASE,
             ID_PEAK_RELEASE_VALUE,
-            307,
+            347,
             self.font,
         );
 
@@ -536,7 +549,7 @@ impl SettingsWindow {
             )
                 | WS_TABSTOP,
             34,
-            360,
+            418,
             126,
             26,
             ID_CROSSHAIR,
@@ -546,14 +559,14 @@ impl SettingsWindow {
         child(
             self.hwnd,
             WC_BUTTON,
-            "切换颜色",
+            "选择颜色",
             WINDOW_STYLE(
                 BS_PUSHBUTTON
                     as u32,
             )
                 | WS_TABSTOP,
             168,
-            358,
+            415,
             102,
             30,
             ID_COLOR,
@@ -564,7 +577,7 @@ impl SettingsWindow {
             self.hwnd,
             "大小(px)",
             282,
-            360,
+            418,
             58,
             24,
             self.font,
@@ -582,8 +595,8 @@ impl SettingsWindow {
                     ) as u32,
                 )
                 | WS_TABSTOP,
-            344,
-            359,
+            338,
+            415,
             58,
             28,
             ID_SIZE,
@@ -605,7 +618,7 @@ impl SettingsWindow {
             )
                 | WS_TABSTOP,
             18,
-            438,
+            478,
             196,
             42,
             ID_START_STOP,
@@ -622,7 +635,7 @@ impl SettingsWindow {
             )
                 | WS_TABSTOP,
             228,
-            438,
+            478,
             196,
             42,
             ID_SAVE,
@@ -759,7 +772,6 @@ impl SettingsWindow {
             ),
         );
 
-        self.refresh_crosshair_color_button();
     }
 
 
@@ -1577,110 +1589,62 @@ impl SettingsWindow {
     // ========================================================
     // Crosshair
     // ========================================================
+unsafe fn choose_crosshair_color(&mut self) {
+    // Sound Lock 当前保存的是 0xRRGGBB
+    let current_rgb =
+        crate::tray_state::CROSSHAIR_COLOR
+            .load(Ordering::SeqCst)
+            & 0x00FF_FFFF;
 
-    unsafe fn cycle_crosshair_color(
-        &self,
-    ) {
-        const COLORS:
-            [u32; 6] =
-            [
-                0x0078FF,
-                0x00FF00,
-                0xFF0000,
-                0xFFFF00,
-                0xFFFFFF,
-                0xFF00FF,
-            ];
+    // 转成 Windows COLORREF
+    let current_colorref =
+        rgb_to_colorref(current_rgb);
 
+    let mut choose_color = CHOOSECOLORW {
+        lStructSize:
+            std::mem::size_of::<CHOOSECOLORW>() as u32,
 
-        let current =
-            crate::tray_state::
-                CROSSHAIR_COLOR
-                .load(
-                    Ordering::SeqCst,
-                );
+        // 让颜色窗口属于 Sound Lock，
+        // 弹出来后会正确位于主窗口前面。
+        hwndOwner: self.hwnd,
 
+        // 打开时默认选中当前准星颜色。
+        rgbResult: current_colorref,
 
-        let next =
-            COLORS
-                .iter()
-                .position(
-                    |v| {
-                        *v
-                            == current
-                    },
-                )
-                .map(
-                    |i| {
-                        COLORS[
-                            (
-                                i + 1
-                            )
-                                % COLORS
-                                    .len()
-                        ]
-                    },
-                )
-                .unwrap_or(
-                    COLORS[0],
-                );
+        // Windows 要求提供 16 个自定义颜色槽。
+        lpCustColors:
+            self.custom_colors.as_mut_ptr(),
+        Flags:
+            CC_RGBINIT
+                | CC_FULLOPEN,
 
+        ..Default::default()
+    };
 
-        crate::tray_state::
-            CROSSHAIR_COLOR
+    // ChooseColorW 是模态原生 Win32 对话框。
+    //
+    // 用户点“确定” -> true
+    // 用户点“取消” -> false
+    if ChooseColorW(
+        &mut choose_color
+    )
+    .as_bool()
+    {
+        // Windows COLORREF
+        // 转回 Sound Lock 的 0xRRGGBB。
+        let rgb =
+            colorref_to_rgb(
+                choose_color.rgbResult
+            );
+
+        crate::tray_state::CROSSHAIR_COLOR
             .store(
-                next,
+                rgb,
                 Ordering::SeqCst,
             );
 
-
-        self.refresh_crosshair_color_button();
     }
-
-
-    unsafe fn refresh_crosshair_color_button(
-        &self,
-    ) {
-        let color =
-            crate::tray_state::
-                CROSSHAIR_COLOR
-                .load(
-                    Ordering::SeqCst,
-                );
-
-
-        let name =
-            match color {
-                0x0078FF =>
-                    "蓝色",
-
-                0x00FF00 =>
-                    "绿色",
-
-                0xFF0000 =>
-                    "红色",
-
-                0xFFFF00 =>
-                    "黄色",
-
-                0xFFFFFF =>
-                    "白色",
-
-                0xFF00FF =>
-                    "紫色",
-
-                _ =>
-                    "自定义",
-            };
-
-
-        self.set_text(
-            ID_COLOR,
-            &format!(
-                "颜色：{name}"
-            ),
-        );
-    }
+}
 
 
     // ========================================================
@@ -1813,7 +1777,7 @@ impl SettingsWindow {
 
             ID_COLOR => {
                 self
-                    .cycle_crosshair_color();
+                    .choose_crosshair_color();
             }
 
 
@@ -2254,7 +2218,23 @@ unsafe extern "system" fn settings_wnd_proc(
         // ----------------------------------------------------
         // Create
         // ----------------------------------------------------
+WM_CTLCOLORSTATIC => {
+    let hdc = HDC(
+        wparam.0 as *mut _
+    );
 
+    let _ = SetBkMode(
+        hdc,
+        TRANSPARENT,
+    );
+
+    return LRESULT(
+        GetSysColorBrush(
+            COLOR_WINDOW
+        )
+        .0 as isize
+    );
+}
         WM_CREATE
             if !state.is_null() =>
         {
@@ -2550,7 +2530,32 @@ unsafe fn label(
     );
 }
 
+fn rgb_to_colorref(rgb: u32) -> COLORREF {
+    let r = (rgb >> 16) & 0xFF;
+    let g = (rgb >> 8) & 0xFF;
+    let b = rgb & 0xFF;
 
+    // Windows COLORREF = 0x00BBGGRR
+    COLORREF(
+        r
+            | (g << 8)
+            | (b << 16)
+    )
+}
+
+
+fn colorref_to_rgb(color: COLORREF) -> u32 {
+    let value = color.0;
+
+    let r = value & 0xFF;
+    let g = (value >> 8) & 0xFF;
+    let b = (value >> 16) & 0xFF;
+
+    // Sound Lock = 0xRRGGBB
+    (r << 16)
+        | (g << 8)
+        | b
+}
 // ============================================================
 // Slider Row
 // ============================================================
@@ -2583,7 +2588,7 @@ unsafe fn slider_row(
         )
             | WS_TABSTOP,
         112,
-        y,
+        y+9,
         212,
         32,
         id,
